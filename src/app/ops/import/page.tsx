@@ -49,13 +49,14 @@ export default async function ImportPage() {
       <ImportForm />
 
       <section className="mt-8 rounded-xl border border-neutral-200 bg-neutral-50 p-4 text-xs text-neutral-500">
-        <p className="mb-2 font-medium text-neutral-700">Recognized columns</p>
+        <p className="mb-2 font-medium text-neutral-700">What to upload</p>
         <p>
-          The export should have a header row with columns for the association/property,
-          unit number, and owner name/email/phone. We recognize common AppFolio header
-          names automatically (e.g. <code>Property</code>, <code>Unit</code>,{" "}
-          <code>Owner</code>, <code>Email</code>, <code>Phone</code>). If your export uses
-          different headers, send a sample and we’ll map them exactly.
+          Your AppFolio <strong>Homeowner Directory</strong> CSV export works as-is —
+          columns <code>Property</code>, <code>Unit</code>, <code>Homeowner</code>,{" "}
+          <code>Phone Numbers</code>, <code>Emails</code> (multiple emails/phones per
+          cell are split automatically, and the footer row is ignored). Re-upload anytime;
+          existing records update and new ones are added. If a different export uses other
+          headers, send a sample and we’ll map them.
         </p>
       </section>
     </main>

@@ -13,23 +13,45 @@ export type SyncResult = {
   error?: string;
 };
 
-// AppFolio (and other) exports use varying column headers. We accept any of
-// these aliases (lower-cased) for each field.
-const ALIASES: Record<string, string[]> = {
-  association_name: ["association_name", "association", "property", "property_name", "property name"],
-  association_address: ["association_address", "address", "property_address", "property address"],
-  unit_number: ["unit_number", "unit", "unit_id", "unit_no", "unit number"],
-  owner_name: ["owner_name", "owner", "name", "owner name", "tenant", "tenant_name"],
-  owner_email: ["owner_email", "email", "email_address", "owner email", "email address"],
-  owner_phone: ["owner_phone", "phone", "phone_number", "owner phone", "phone 1"],
+// Column aliases (lower-cased). Supports AppFolio's "homeowner directory"
+// export (Property / Unit / Homeowner / Phone Numbers / Emails) as well as a
+// simpler split-column format.
+const COL = {
+  property: ["property", "association", "association_name", "property_name", "property name"],
+  address: ["association_address", "address", "property_address", "property address"],
+  unit: ["unit", "unit_number", "unit_id", "unit_no", "unit number"],
+  owner: ["homeowner", "owner", "owner_name", "owner name", "name", "tenant", "tenant_name"],
+  email: ["emails", "email", "owner_email", "email_address", "owner email", "email address"],
+  phone: ["phone numbers", "phone_numbers", "phone", "owner_phone", "phone_number", "owner phone"],
 };
 
-function pick(row: Record<string, string>, key: string): string {
-  for (const alias of ALIASES[key]) {
-    const v = row[alias];
+const field = (row: Record<string, string>, aliases: string[]): string => {
+  for (const a of aliases) {
+    const v = row[a];
     if (v != null && v !== "") return v;
   }
   return "";
+};
+const hasCol = (rows: Record<string, string>[], aliases: string[]): boolean =>
+  rows.length > 0 && aliases.some((a) => a in rows[0]);
+
+// "Avers - Ainslie Condominium Association - 4855 N Avers..." → split at the
+// " - " that precedes the street number, so names containing " - " survive.
+function splitProp(p: string): [string, string] {
+  p = p.trim();
+  const m = p.match(/^(.*?) - (\d.*)$/);
+  if (m) return [m[1].replace(/^["']|["']$/g, "").trim(), m[2].trim()];
+  const d = p.indexOf(" - ");
+  if (d >= 0) return [p.slice(0, d).replace(/^["']|["']$/g, "").trim(), p.slice(d + 3).trim()];
+  return [p.replace(/^["']|["']$/g, "").trim(), ""];
+}
+
+function cleanPhones(cell: string): string {
+  const list = cell
+    .split(/[,;]/)
+    .map((p) => p.replace(/^\s*(home|mobile|office|work|fax|cell|phone)\s*:\s*/i, "").trim())
+    .filter(Boolean);
+  return [...new Set(list)].join(", ");
 }
 
 function chunk<T>(arr: T[], size: number): T[][] {
@@ -38,18 +60,11 @@ function chunk<T>(arr: T[], size: number): T[][] {
   return out;
 }
 
-const fail = (error: string): SyncResult => ({
-  ok: false,
-  rows: 0,
-  associations: 0,
-  units: 0,
-  owners: 0,
-  error,
-});
+const fail = (error: string): SyncResult => ({ ok: false, rows: 0, associations: 0, units: 0, owners: 0, error });
 
-// Parses an AppFolio CSV export and upserts associations / units / owners.
-// Idempotent: re-running with a fresh export updates existing rows (each unit
-// re-points to its current owner) and adds new ones. Bulk upserts keep it fast.
+// Parses an AppFolio export and upserts associations / units / owners as the
+// agents' recognition table. Idempotent and non-destructive (re-running updates
+// existing records and adds new ones). Bulk upserts keep ~1,300 units fast.
 export async function syncAppfolio(
   _prev: SyncResult | null,
   formData: FormData,
@@ -69,44 +84,60 @@ export async function syncAppfolio(
     if (!companyId) return fail("Your session is missing a company — sign in again.");
 
     const db = supabase as any; // avoid deep generic instantiation on chained upserts
+    const addrColumnPresent = hasCol(rows, COL.address);
 
-    // 1) Associations (unique by name)
-    const assocByName = new Map<string, { company_id: string; name: string; address: string | null }>();
+    // Aggregate the CSV into associations / units / owner rows.
+    const assocAddr = new Map<string, string | null>();
+    const unitSet = new Map<string, { name: string; number: string }>();
+    type OwnerRow = { assoc: string; unit: string; name: string; email: string | null; phone: string | null };
+    const ownerRows: OwnerRow[] = [];
+
     for (const r of rows) {
-      const name = pick(r, "association_name");
-      if (name && !assocByName.has(name)) {
-        assocByName.set(name, {
-          company_id: companyId,
-          name,
-          address: pick(r, "association_address") || null,
-        });
+      const propCell = field(r, COL.property).trim();
+      const unit = field(r, COL.unit).trim();
+      const owner = field(r, COL.owner).replace(/^&\s*/, "").replace(/\s+/g, " ").trim();
+      // Skip footer / blank rows (e.g. "Total,,,,,,").
+      if (!propCell || propCell.toLowerCase() === "total" || (!unit && !owner)) continue;
+
+      const [aName, aAddr] = addrColumnPresent
+        ? [propCell.replace(/^["']|["']$/g, "").trim(), field(r, COL.address) || ""]
+        : splitProp(propCell);
+      if (!aName) continue;
+
+      if (!assocAddr.has(aName)) assocAddr.set(aName, aAddr || null);
+      if (unit) unitSet.set(`${aName}::${unit}`, { name: aName, number: unit });
+
+      const phone = cleanPhones(field(r, COL.phone)) || null;
+      const emails = field(r, COL.email)
+        .split(/[,;]/)
+        .map((e) => e.trim().toLowerCase())
+        .filter((e) => e.includes("@"));
+
+      if (emails.length) {
+        for (const email of emails) ownerRows.push({ assoc: aName, unit, name: owner || "Owner", email, phone });
+      } else if (unit) {
+        ownerRows.push({ assoc: aName, unit, name: owner || "Owner", email: null, phone });
       }
     }
+
+    // 1) Associations
     const assocIdByName = new Map<string, string>();
-    const assocNameById = new Map<string, string>();
-    for (const part of chunk([...assocByName.values()], 500)) {
+    const assocRows = [...assocAddr.entries()].map(([name, address]) => ({ company_id: companyId, name, address }));
+    for (const part of chunk(assocRows, 200)) {
       const { data, error } = await db
         .from("associations")
         .upsert(part, { onConflict: "company_id,name" })
         .select("id,name");
       if (error) throw error;
-      for (const a of data) {
-        assocIdByName.set(a.name, a.id);
-        assocNameById.set(a.id, a.name);
-      }
+      for (const a of data) assocIdByName.set(a.name, a.id);
     }
 
-    // 2) Units (unique by association + number)
-    const unitByKey = new Map<string, { company_id: string; association_id: string; number: string }>();
-    for (const r of rows) {
-      const an = pick(r, "association_name");
-      const num = pick(r, "unit_number");
-      const aid = assocIdByName.get(an);
-      if (!aid || !num) continue;
-      unitByKey.set(`${aid}::${num}`, { company_id: companyId, association_id: aid, number: num });
-    }
+    // 2) Units
     const unitIdByKey = new Map<string, string>();
-    for (const part of chunk([...unitByKey.values()], 500)) {
+    const unitRows = [...unitSet.values()]
+      .map((u) => ({ company_id: companyId, association_id: assocIdByName.get(u.name), number: u.number }))
+      .filter((u) => u.association_id);
+    for (const part of chunk(unitRows, 500)) {
       const { data, error } = await db
         .from("units")
         .upsert(part, { onConflict: "company_id,association_id,number" })
@@ -115,36 +146,23 @@ export async function syncAppfolio(
       for (const u of data) unitIdByKey.set(`${u.association_id}::${u.number}`, u.id);
     }
 
-    // 3) Owners (unique by email) — tie each to its unit so inbound email can
-    //    be matched to the right association.
-    const ownerByEmail = new Map<string, any>();
-    const ownersNoEmail: any[] = [];
-    for (const r of rows) {
-      const name = pick(r, "owner_name");
-      if (!name) continue;
-      const an = pick(r, "association_name");
-      const num = pick(r, "unit_number");
-      const aid = assocIdByName.get(an);
-      const unitId = aid ? unitIdByKey.get(`${aid}::${num}`) ?? null : null;
-      const email = pick(r, "owner_email");
-      const owner = {
-        company_id: companyId,
-        name,
-        email: email || null,
-        phone: pick(r, "owner_phone") || null,
-        unit_id: unitId,
-      };
-      if (email) ownerByEmail.set(email.toLowerCase(), owner);
-      else ownersNoEmail.push(owner);
+    // 3) Owners — dedupe by email (last wins); keep null-email rows.
+    const byEmail = new Map<string, any>();
+    const noEmail: any[] = [];
+    for (const o of ownerRows) {
+      const aid = assocIdByName.get(o.assoc);
+      const unitId = aid ? unitIdByKey.get(`${aid}::${o.unit}`) ?? null : null;
+      const row = { company_id: companyId, name: o.name, email: o.email, phone: o.phone, unit_id: unitId };
+      if (o.email) byEmail.set(o.email, row);
+      else noEmail.push(row);
     }
     let ownerCount = 0;
-    for (const part of chunk([...ownerByEmail.values()], 500)) {
+    for (const part of chunk([...byEmail.values()], 500)) {
       const { error } = await db.from("owners").upsert(part, { onConflict: "company_id,email" });
       if (error) throw error;
       ownerCount += part.length;
     }
-    // Owners without an email can't be safely de-duplicated; insert as-is.
-    for (const part of chunk(ownersNoEmail, 500)) {
+    for (const part of chunk(noEmail, 500)) {
       const { error } = await db.from("owners").insert(part);
       if (error) throw error;
       ownerCount += part.length;
