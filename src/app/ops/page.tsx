@@ -85,6 +85,12 @@ export default async function OpsDashboard({
           >
             Recurring
           </Link>
+          <Link
+            href="/ops/import"
+            className="rounded-lg border border-neutral-300 px-3 py-1.5 text-sm font-medium text-neutral-600 transition hover:bg-neutral-50"
+          >
+            Sync
+          </Link>
           <AssociationFilter associations={associations ?? []} />
           <form action={signOut}>
             <button className="rounded-lg border border-neutral-300 px-3 py-1.5 text-sm font-medium text-neutral-600 transition hover:bg-neutral-50">
