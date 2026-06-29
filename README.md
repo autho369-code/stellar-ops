@@ -59,10 +59,28 @@ association, and — if an Anthropic key is set — classifies urgency and write
    ```bash
    supabase secrets set MS_TENANT_ID=... MS_CLIENT_ID=... MS_CLIENT_SECRET=...
    supabase secrets set OUTLOOK_MAILBOXES="a@stellar...,b@stellar...,c@..."
-   supabase secrets set ANTHROPIC_API_KEY=...        # optional: enables triage + drafting
    ```
 5. Invoke or schedule `ingest-outlook`. Without these secrets it returns
    `{"configured": false}` and does nothing.
+
+**LLM provider (optional — enables urgency triage + draft replies).** Pick one;
+for a 24/7 poller a small/cheap model is plenty. Auto-detected from whichever key
+is set, or force with `LLM_PROVIDER`.
+
+```bash
+# Option A — Anthropic
+supabase secrets set ANTHROPIC_API_KEY=...           # ANTHROPIC_MODEL default claude-sonnet-4-6
+                                                     # (claude-haiku-4-5 is cheaper for 24/7)
+
+# Option B — any OpenAI-compatible endpoint (OpenAI, Groq, DeepSeek, OpenRouter,
+# Together, Mistral, local Ollama, ...). One adapter, just change base URL + model.
+supabase secrets set OPENAI_API_KEY=...
+supabase secrets set OPENAI_MODEL=gpt-4o-mini        # or llama-3.1-8b, deepseek-chat, etc.
+supabase secrets set OPENAI_BASE_URL=https://api.openai.com/v1   # e.g. https://api.groq.com/openai/v1
+```
+
+If neither key is set, items are still created (priority `routine`, no draft).
+The function response includes `"provider"` so you can confirm which one ran.
 
 ## Edge functions
 
