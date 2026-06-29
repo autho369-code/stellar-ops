@@ -1,3 +1,4 @@
+import Link from "next/link";
 import { redirect } from "next/navigation";
 import { createClient } from "@/lib/supabase/server";
 import { signOut } from "../login/actions";
@@ -72,6 +73,12 @@ export default async function OpsDashboard({
           <p className="mt-0.5 text-sm text-neutral-500">{user.email}</p>
         </div>
         <div className="flex items-center gap-3">
+          <Link
+            href="/ops/recurring"
+            className="rounded-lg border border-neutral-300 px-3 py-1.5 text-sm font-medium text-neutral-600 transition hover:bg-neutral-50"
+          >
+            Recurring
+          </Link>
           <AssociationFilter associations={associations ?? []} />
           <form action={signOut}>
             <button className="rounded-lg border border-neutral-300 px-3 py-1.5 text-sm font-medium text-neutral-600 transition hover:bg-neutral-50">
