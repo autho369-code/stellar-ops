@@ -41,8 +41,14 @@ export default async function OpsDashboard({
   const byAssociation = (q: any) =>
     association ? q.eq("association_id", association) : q;
 
-  // Three columns, queried in parallel.
-  const [myQueue, overdue, emergencies] = await Promise.all([
+  // Queues, queried in parallel.
+  const [incoming, myQueue, overdue, emergencies] = await Promise.all([
+    byAssociation(
+      workItems()
+        .is("owner_user_id", null)
+        .eq("status", "open")
+        .order("due_date", { ascending: true, nullsFirst: false }),
+    ),
     byAssociation(
       workItems()
         .eq("owner_user_id", user.id)
@@ -88,7 +94,14 @@ export default async function OpsDashboard({
         </div>
       </header>
 
-      <div className="grid grid-cols-1 gap-8 lg:grid-cols-3">
+      <div className="grid grid-cols-1 gap-8 md:grid-cols-2 xl:grid-cols-4">
+        <QueueColumn
+          title="Incoming"
+          items={(incoming.data as WorkItem[]) ?? []}
+          associationNames={associationNames}
+          currentUserId={user.id}
+          emptyText="Inbox clear — nothing waiting to be claimed."
+        />
         <QueueColumn
           title="My Queue"
           items={(myQueue.data as WorkItem[]) ?? []}
