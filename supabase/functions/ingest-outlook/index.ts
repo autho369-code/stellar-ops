@@ -1,25 +1,20 @@
 // ingest-outlook — scheduled email agent.
 // Polls unread mail across the configured Outlook mailboxes via Microsoft Graph
 // (app-only / client-credentials), turns each new message into an email_doc
-// work_item, best-effort tags it to the owner's association, and — when an LLM
-// is configured — classifies urgency and drops a DRAFT reply into the sender
-// mailbox's Drafts for a human to review and send.
+// work_item, best-effort tags it to the owner's association, and classifies
+// urgency. It writes a DRAFT reply into the mailbox's Drafts ONLY when
+// ENABLE_DRAFTS=true — by default it is triage-only (no replies written), so
+// the agent can be evaluated before it ever drafts.
 //
 // Required function secrets:
 //   MS_TENANT_ID, MS_CLIENT_ID, MS_CLIENT_SECRET   (Azure app registration)
-//   OUTLOOK_MAILBOXES  = comma-separated UPNs, e.g. "a@x.com,b@x.com"
+//   OUTLOOK_MAILBOXES  = comma-separated UPNs
 // Optional:
-//   COMPANY_ID         (defaults to the Stellar company)
-//   MAX_PER_MAILBOX    (default 10)
-//
-// LLM provider (optional — without it, items are created with routine priority
-// and no draft). Pick ONE:
-//   LLM_PROVIDER = anthropic | openai      (auto-detected from whichever key is set)
-//   Anthropic:        ANTHROPIC_API_KEY,  ANTHROPIC_MODEL (default claude-sonnet-4-6)
-//   OpenAI-compatible: OPENAI_API_KEY,     OPENAI_MODEL  (default gpt-4o-mini),
-//                      OPENAI_BASE_URL (default https://api.openai.com/v1)
-//   The OpenAI-compatible path works with OpenAI, Groq, DeepSeek, OpenRouter,
-//   Together, Mistral, or a local Ollama (set OPENAI_BASE_URL to its /v1 URL).
+//   COMPANY_ID, MAX_PER_MAILBOX (default 10)
+//   ENABLE_DRAFTS = "true" to let it draft replies (default OFF — triage only)
+//   LLM provider (for triage/drafts): LLM_PROVIDER = anthropic | openai
+//     Anthropic:        ANTHROPIC_API_KEY, ANTHROPIC_MODEL (default claude-sonnet-4-6)
+//     OpenAI-compatible: OPENAI_API_KEY, OPENAI_MODEL (default gpt-4o-mini), OPENAI_BASE_URL
 import "jsr:@supabase/functions-js/edge-runtime.d.ts";
 import { createClient } from "jsr:@supabase/supabase-js@2";
 
@@ -40,13 +35,18 @@ type GraphMessage = {
 
 type Triage = { priority: "emergency" | "urgent" | "routine"; draft: string | null };
 
-const SYSTEM_PROMPT =
-  "You triage email for Stellar Property Group, an HOA/condo manager. " +
-  "Given an incoming email, return STRICT JSON only: " +
-  '{"priority":"emergency|urgent|routine","draft":"a concise, professional reply"}. ' +
+const PRIORITY_RULES =
   "emergency = active damage/safety (flooding, fire, no heat, gas). " +
-  "urgent = time-sensitive (insurance, legal, board deadline). routine = everything else. " +
-  "Keep the draft brief and do not invent facts or commitments.";
+  "urgent = time-sensitive (insurance, legal, board deadline). routine = everything else.";
+
+function systemPrompt(wantDraft: boolean): string {
+  const base = "You triage email for Stellar Property Group, an HOA/condo manager. " + PRIORITY_RULES + " ";
+  return wantDraft
+    ? base +
+        'Return STRICT JSON only: {"priority":"emergency|urgent|routine","draft":"a concise, professional reply"}. ' +
+        "Keep the draft brief and do not invent facts or commitments."
+    : base + 'Return STRICT JSON only: {"priority":"emergency|urgent|routine"}.';
+}
 
 function userPrompt(msg: GraphMessage): string {
   return (
@@ -55,7 +55,6 @@ function userPrompt(msg: GraphMessage): string {
   );
 }
 
-// Which provider to use, based on LLM_PROVIDER + whichever key is present.
 function selectedProvider(): "anthropic" | "openai" | null {
   const explicit = Deno.env.get("LLM_PROVIDER")?.toLowerCase();
   if (explicit === "anthropic") return Deno.env.get("ANTHROPIC_API_KEY") ? "anthropic" : null;
@@ -66,7 +65,7 @@ function selectedProvider(): "anthropic" | "openai" | null {
   return null;
 }
 
-async function anthropicComplete(msg: GraphMessage): Promise<string> {
+async function anthropicComplete(system: string, msg: GraphMessage): Promise<string> {
   const res = await fetch("https://api.anthropic.com/v1/messages", {
     method: "POST",
     headers: {
@@ -77,7 +76,7 @@ async function anthropicComplete(msg: GraphMessage): Promise<string> {
     body: JSON.stringify({
       model: Deno.env.get("ANTHROPIC_MODEL") ?? DEFAULT_ANTHROPIC_MODEL,
       max_tokens: 1024,
-      system: SYSTEM_PROMPT,
+      system,
       messages: [{ role: "user", content: userPrompt(msg) }],
     }),
   });
@@ -86,20 +85,17 @@ async function anthropicComplete(msg: GraphMessage): Promise<string> {
   return data.content?.[0]?.text ?? "";
 }
 
-async function openaiComplete(msg: GraphMessage): Promise<string> {
+async function openaiComplete(system: string, msg: GraphMessage): Promise<string> {
   const base = (Deno.env.get("OPENAI_BASE_URL") ?? DEFAULT_OPENAI_BASE).replace(/\/$/, "");
   const res = await fetch(`${base}/chat/completions`, {
     method: "POST",
-    headers: {
-      Authorization: `Bearer ${Deno.env.get("OPENAI_API_KEY")!}`,
-      "Content-Type": "application/json",
-    },
+    headers: { Authorization: `Bearer ${Deno.env.get("OPENAI_API_KEY")!}`, "Content-Type": "application/json" },
     body: JSON.stringify({
       model: Deno.env.get("OPENAI_MODEL") ?? DEFAULT_OPENAI_MODEL,
       max_tokens: 1024,
       temperature: 0.2,
       messages: [
-        { role: "system", content: SYSTEM_PROMPT },
+        { role: "system", content: system },
         { role: "user", content: userPrompt(msg) },
       ],
     }),
@@ -109,48 +105,38 @@ async function openaiComplete(msg: GraphMessage): Promise<string> {
   return data.choices?.[0]?.message?.content ?? "";
 }
 
-// Classify urgency + draft a reply via the selected provider. Resilient: any
-// failure yields a routine, no-draft result so ingestion never blocks on the LLM.
 async function classifyAndDraft(
   provider: "anthropic" | "openai",
   msg: GraphMessage,
+  wantDraft: boolean,
 ): Promise<Triage> {
   try {
-    const text = provider === "anthropic" ? await anthropicComplete(msg) : await openaiComplete(msg);
+    const system = systemPrompt(wantDraft);
+    const text = provider === "anthropic" ? await anthropicComplete(system, msg) : await openaiComplete(system, msg);
     const parsed = JSON.parse(text.slice(text.indexOf("{"), text.lastIndexOf("}") + 1));
-    const priority = ["emergency", "urgent", "routine"].includes(parsed.priority)
-      ? parsed.priority
-      : "routine";
-    return { priority, draft: typeof parsed.draft === "string" ? parsed.draft : null };
+    const priority = ["emergency", "urgent", "routine"].includes(parsed.priority) ? parsed.priority : "routine";
+    return { priority, draft: wantDraft && typeof parsed.draft === "string" ? parsed.draft : null };
   } catch (_) {
     return { priority: "routine", draft: null };
   }
 }
 
 async function getGraphToken(tenant: string, clientId: string, secret: string) {
-  const res = await fetch(
-    `https://login.microsoftonline.com/${tenant}/oauth2/v2.0/token`,
-    {
-      method: "POST",
-      headers: { "Content-Type": "application/x-www-form-urlencoded" },
-      body: new URLSearchParams({
-        client_id: clientId,
-        client_secret: secret,
-        scope: "https://graph.microsoft.com/.default",
-        grant_type: "client_credentials",
-      }),
-    },
-  );
+  const res = await fetch(`https://login.microsoftonline.com/${tenant}/oauth2/v2.0/token`, {
+    method: "POST",
+    headers: { "Content-Type": "application/x-www-form-urlencoded" },
+    body: new URLSearchParams({
+      client_id: clientId,
+      client_secret: secret,
+      scope: "https://graph.microsoft.com/.default",
+      grant_type: "client_credentials",
+    }),
+  });
   if (!res.ok) throw new Error(`Graph token failed: ${res.status} ${await res.text()}`);
   return (await res.json()).access_token as string;
 }
 
-async function createDraftReply(
-  token: string,
-  mailbox: string,
-  messageId: string,
-  body: string,
-): Promise<boolean> {
+async function createDraftReply(token: string, mailbox: string, messageId: string, body: string): Promise<boolean> {
   try {
     const replyRes = await fetch(
       `${GRAPH}/users/${encodeURIComponent(mailbox)}/messages/${messageId}/createReply`,
@@ -158,14 +144,11 @@ async function createDraftReply(
     );
     if (!replyRes.ok) return false;
     const draft = await replyRes.json();
-    const patchRes = await fetch(
-      `${GRAPH}/users/${encodeURIComponent(mailbox)}/messages/${draft.id}`,
-      {
-        method: "PATCH",
-        headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json" },
-        body: JSON.stringify({ body: { contentType: "Text", content: body } }),
-      },
-    );
+    const patchRes = await fetch(`${GRAPH}/users/${encodeURIComponent(mailbox)}/messages/${draft.id}`, {
+      method: "PATCH",
+      headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json" },
+      body: JSON.stringify({ body: { contentType: "Text", content: body } }),
+    });
     return patchRes.ok;
   } catch (_) {
     return false;
@@ -176,8 +159,7 @@ Deno.serve(async (req: Request) => {
   const secret = Deno.env.get("CRON_SECRET");
   if (secret) {
     const provided =
-      req.headers.get("x-cron-secret") ??
-      req.headers.get("authorization")?.replace(/^Bearer\s+/i, "");
+      req.headers.get("x-cron-secret") ?? req.headers.get("authorization")?.replace(/^Bearer\s+/i, "");
     if (provided !== secret) {
       return new Response(JSON.stringify({ error: "unauthorized" }), { status: 401 });
     }
@@ -186,10 +168,7 @@ Deno.serve(async (req: Request) => {
   const tenant = Deno.env.get("MS_TENANT_ID");
   const clientId = Deno.env.get("MS_CLIENT_ID");
   const clientSecret = Deno.env.get("MS_CLIENT_SECRET");
-  const mailboxes = (Deno.env.get("OUTLOOK_MAILBOXES") ?? "")
-    .split(",")
-    .map((m) => m.trim())
-    .filter(Boolean);
+  const mailboxes = (Deno.env.get("OUTLOOK_MAILBOXES") ?? "").split(",").map((m) => m.trim()).filter(Boolean);
 
   if (!tenant || !clientId || !clientSecret || mailboxes.length === 0) {
     return new Response(
@@ -203,12 +182,10 @@ Deno.serve(async (req: Request) => {
 
   const companyId = Deno.env.get("COMPANY_ID") ?? DEFAULT_COMPANY;
   const provider = selectedProvider();
+  const draftsEnabled = Deno.env.get("ENABLE_DRAFTS") === "true";
   const maxPer = Number(Deno.env.get("MAX_PER_MAILBOX") ?? 10);
 
-  const supabase = createClient(
-    Deno.env.get("SUPABASE_URL")!,
-    Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")!,
-  );
+  const supabase = createClient(Deno.env.get("SUPABASE_URL")!, Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")!);
 
   let token: string;
   try {
@@ -244,7 +221,6 @@ Deno.serve(async (req: Request) => {
 
       const fromAddr = msg.from?.emailAddress?.address ?? null;
 
-      // Best-effort: match sender to an owner to tag the association.
       let associationId: string | null = null;
       let unitId: string | null = null;
       if (fromAddr) {
@@ -261,12 +237,11 @@ Deno.serve(async (req: Request) => {
       }
 
       const triage: Triage = provider
-        ? await classifyAndDraft(provider, msg)
+        ? await classifyAndDraft(provider, msg, draftsEnabled)
         : { priority: "routine", draft: null };
 
-      // Draft first, so we can record draft_created on the work_item itself.
       let draftCreated = false;
-      if (triage.draft) {
+      if (draftsEnabled && triage.draft) {
         draftCreated = await createDraftReply(token, mailbox, msg.id, triage.draft);
         if (draftCreated) drafted++;
       }
@@ -310,6 +285,7 @@ Deno.serve(async (req: Request) => {
     JSON.stringify({
       configured: true,
       provider: provider ?? "none",
+      drafts_enabled: draftsEnabled,
       mailboxes: mailboxes.length,
       created,
       drafted,
