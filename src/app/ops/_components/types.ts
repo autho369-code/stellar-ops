@@ -10,4 +10,10 @@ export type WorkItem = {
   association_id: string | null;
   due_date: string | null;
   created_at: string;
+  metadata: {
+    web_link?: string;
+    from?: string;
+    mailbox?: string;
+    draft_created?: boolean;
+  } | null;
 };

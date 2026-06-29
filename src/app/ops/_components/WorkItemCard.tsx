@@ -74,6 +74,26 @@ export function WorkItemCard({
         </span>
       </div>
 
+      {(item.metadata?.web_link || item.metadata?.draft_created) && (
+        <div className="mt-2 flex flex-wrap items-center gap-2 text-[11px]">
+          {item.metadata?.web_link && (
+            <a
+              href={item.metadata.web_link}
+              target="_blank"
+              rel="noopener noreferrer"
+              className="font-medium text-blue-600 hover:underline"
+            >
+              Open in Outlook ↗
+            </a>
+          )}
+          {item.metadata?.draft_created && (
+            <span className="rounded-full bg-green-100 px-2 py-0.5 font-medium text-green-700">
+              Reply drafted
+            </span>
+          )}
+        </div>
+      )}
+
       <form className="mt-3 flex flex-wrap gap-1.5">
         <input type="hidden" name="id" value={item.id} />
 

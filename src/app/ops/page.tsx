@@ -9,7 +9,7 @@ import type { WorkItem } from "./_components/types";
 export const dynamic = "force-dynamic";
 
 const WORK_ITEM_COLUMNS =
-  "id, type, title, description, source_channel, status, priority, owner_user_id, association_id, due_date, created_at";
+  "id, type, title, description, source_channel, status, priority, owner_user_id, association_id, due_date, created_at, metadata";
 
 export default async function OpsDashboard({
   searchParams,

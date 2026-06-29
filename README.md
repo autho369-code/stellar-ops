@@ -42,6 +42,28 @@ association_address, unit_number, owner_name, owner_email, owner_phone`), save a
 npx tsx scripts/import-appfolio.ts
 ```
 
+## Outlook email agent (`ingest-outlook`)
+
+Polls unread mail across your staff mailboxes via Microsoft Graph (app-only),
+creates an `email_doc` work item per message, best-effort tags it to the owner's
+association, and — if an Anthropic key is set — classifies urgency and writes a
+**draft reply into that mailbox's Outlook Drafts** for a human to review and send.
+
+**Azure setup (you are the M365 admin):**
+1. https://entra.microsoft.com → App registrations → New registration → name it
+   "Stellar Ops". Copy the **Application (client) ID** and **Directory (tenant) ID**.
+2. Certificates & secrets → New client secret → copy the **Value** immediately.
+3. API permissions → Add → Microsoft Graph → **Application permissions** →
+   add `Mail.Read` and `Mail.ReadWrite` → **Grant admin consent**.
+4. Set the function secrets:
+   ```bash
+   supabase secrets set MS_TENANT_ID=... MS_CLIENT_ID=... MS_CLIENT_SECRET=...
+   supabase secrets set OUTLOOK_MAILBOXES="a@stellar...,b@stellar...,c@..."
+   supabase secrets set ANTHROPIC_API_KEY=...        # optional: enables triage + drafting
+   ```
+5. Invoke or schedule `ingest-outlook`. Without these secrets it returns
+   `{"configured": false}` and does nothing.
+
 ## Edge functions
 
 Deployed via the Supabase MCP. To run locally / redeploy with the CLI:
@@ -49,6 +71,8 @@ Deployed via the Supabase MCP. To run locally / redeploy with the CLI:
 ```bash
 supabase functions deploy escalate-overdue
 supabase functions deploy daily-digest
+supabase functions deploy generate-recurring
+supabase functions deploy ingest-outlook
 ```
 
 Schedule `escalate-overdue` daily (Supabase Dashboard → Edge Functions → Schedules, or
