@@ -48,8 +48,8 @@ function userPrompt(msg: GraphMessage): string {
   );
 }
 
-function selectedProvider(): "anthropic" | "openai" | null {
-  const explicit = Deno.env.get("LLM_PROVIDER")?.toLowerCase();
+function selectedProvider(override?: string | null): "anthropic" | "openai" | null {
+  const explicit = (override || Deno.env.get("LLM_PROVIDER"))?.toLowerCase();
   if (explicit === "anthropic") return Deno.env.get("ANTHROPIC_API_KEY") ? "anthropic" : null;
   if (explicit === "openai" || explicit === "openai-compatible") return Deno.env.get("OPENAI_API_KEY") ? "openai" : null;
   if (Deno.env.get("ANTHROPIC_API_KEY")) return "anthropic";
@@ -359,7 +359,6 @@ Deno.serve(async (req: Request) => {
   }
 
   const companyId = Deno.env.get("COMPANY_ID") ?? DEFAULT_COMPANY;
-  const provider = selectedProvider();
   const draftsEnabled = Deno.env.get("ENABLE_DRAFTS") === "true";
   const maxPer = Number(Deno.env.get("MAX_PER_MAILBOX") ?? 10);
 
@@ -383,12 +382,13 @@ Deno.serve(async (req: Request) => {
   const signatureByMailbox = new Map<string, string>((tmRows ?? []).filter((t: any) => t.signature).map((t: any) => [String(t.email).toLowerCase(), t.signature]));
   const modeByMailbox = new Map<string, string>((tmRows ?? []).map((t: any) => [String(t.email).toLowerCase(), t.agent_mode || "full"]));
 
-  const { data: settings } = await supabase.from("agent_settings").select("triage_rules,draft_guidance,agent_name,persona,schedule_tz,active_start_hour,active_end_hour,active_interval_min,quiet_interval_min,active_days,last_run_at").eq("company_id", companyId).maybeSingle();
+  const { data: settings } = await supabase.from("agent_settings").select("triage_rules,draft_guidance,agent_name,persona,schedule_tz,active_start_hour,active_end_hour,active_interval_min,quiet_interval_min,active_days,last_run_at,llm_provider").eq("company_id", companyId).maybeSingle();
   const s = (settings as any) ?? {};
   const rules = s.triage_rules || DEFAULT_RULES;
   const guidance = s.draft_guidance || null;
   const agentName = s.agent_name || "Arthur";
   const persona = s.persona || null;
+  const provider = selectedProvider(s.llm_provider);
 
   // Schedule gate: honor the editable active hours / interval unless forced.
   let force = false;

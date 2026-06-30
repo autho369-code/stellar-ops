@@ -12,8 +12,8 @@ const DEFAULT_OPENAI_BASE = "https://api.openai.com/v1";
 
 type Msg = { role: "user" | "assistant"; content: string };
 
-function selectedProvider(): "anthropic" | "openai" | null {
-  const explicit = Deno.env.get("LLM_PROVIDER")?.toLowerCase();
+function selectedProvider(override?: string | null): "anthropic" | "openai" | null {
+  const explicit = (override || Deno.env.get("LLM_PROVIDER"))?.toLowerCase();
   if (explicit === "anthropic") return Deno.env.get("ANTHROPIC_API_KEY") ? "anthropic" : null;
   if (explicit === "openai" || explicit === "openai-compatible") return Deno.env.get("OPENAI_API_KEY") ? "openai" : null;
   if (Deno.env.get("ANTHROPIC_API_KEY")) return "anthropic";
@@ -126,9 +126,10 @@ Deno.serve(async (req: Request) => {
   const companyId = Deno.env.get("COMPANY_ID") ?? DEFAULT_COMPANY;
   const supabase = createClient(Deno.env.get("SUPABASE_URL")!, Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")!);
 
-  const { data: settings } = await supabase.from("agent_settings").select("agent_name,persona").eq("company_id", companyId).maybeSingle();
+  const { data: settings } = await supabase.from("agent_settings").select("agent_name,persona,llm_provider").eq("company_id", companyId).maybeSingle();
   const name = (settings as any)?.agent_name || "Arthur";
   const persona = (settings as any)?.persona || "";
+  const llmProviderOverride = (settings as any)?.llm_provider as string | null | undefined;
 
   let context = "";
   try { context = await buildContext(supabase, companyId); } catch (_) { context = "OPERATIONS CONTEXT: (unavailable)"; }
@@ -150,7 +151,7 @@ Deno.serve(async (req: Request) => {
     "You CANNOT send or finalize emails — drafts are reviewed and sent by a person from Outlook; if asked to send, say so.\n\n" +
     context;
 
-  const provider = selectedProvider();
+  const provider = selectedProvider(llmProviderOverride);
   if (!provider) return json({ error: "No LLM provider configured." }, 500);
   try {
     let reply = provider === "anthropic" ? await callAnthropic(system, messages) : await callOpenai(system, messages);

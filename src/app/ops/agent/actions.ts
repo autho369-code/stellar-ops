@@ -40,6 +40,7 @@ export async function saveAgentSettings(formData: FormData) {
       active_days: (days.length ? days : [1, 2, 3, 4, 5, 6, 7]).join(","),
       triage_rules: String(formData.get("triage_rules") ?? "").trim(),
       draft_guidance: String(formData.get("draft_guidance") ?? "").trim(),
+      llm_provider: ["anthropic", "openai"].includes(String(formData.get("llm_provider"))) ? String(formData.get("llm_provider")) : null,
       updated_at: new Date().toISOString(),
     },
     { onConflict: "company_id" },

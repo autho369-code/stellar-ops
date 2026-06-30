@@ -198,6 +198,17 @@ export default async function AgentPage() {
             </p>
             <textarea id="persona" name="persona" rows={4} defaultValue={s.persona ?? ""} className={field.replace("p-2", "p-3")} />
           </div>
+          <div>
+            <label htmlFor="llm_provider" className="mb-1 block text-xs font-medium text-neutral-600">Model</label>
+            <p className="mb-2 text-xs text-neutral-500">
+              Which AI {name} thinks with — for triage, drafts, and chat. Switch any time, no redeploy.
+            </p>
+            <select id="llm_provider" name="llm_provider" defaultValue={s.llm_provider ?? ""} className={field}>
+              <option value="">Auto (uses whichever key is configured)</option>
+              <option value="openai">DeepSeek</option>
+              <option value="anthropic">Claude (Anthropic)</option>
+            </select>
+          </div>
         </section>
 
         {/* Schedule */}
