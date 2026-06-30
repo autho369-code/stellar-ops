@@ -82,6 +82,12 @@ export default async function AgentPage() {
             <h1 className="text-xl font-semibold tracking-tight text-neutral-900">{name}</h1>
             <p className="text-sm text-neutral-500">Your operations intake assistant — email, phone, documents.</p>
           </div>
+          <Link
+            href="/ops/agent/chat"
+            className="ml-auto rounded-lg bg-neutral-900 px-3.5 py-2 text-sm font-medium text-white transition hover:bg-neutral-800"
+          >
+            Chat with {name}
+          </Link>
         </div>
       </header>
 
