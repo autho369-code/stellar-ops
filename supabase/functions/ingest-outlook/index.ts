@@ -103,6 +103,32 @@ function matchAssociationByText(text: string, assocs: { id: string; nameLower: s
   return bestId;
 }
 
+const STREET_STOP = new Set(["n","s","e","w","north","south","east","west","ave","av","avenue","st","street","dr","drive","blvd","boulevard","court","ct","rd","road","ln","lane","place","pl","terrace","ter","way","pkwy","parkway","cir","circle","sq","square","chicago","il","unit","apt","suite","ste","floor","fl"]);
+
+// Extract (number, street) pairs from a free-text address or email body.
+function addressPairs(text: string): { num: number; street: string }[] {
+  const out: { num: number; street: string }[] = [];
+  const re = /(\d{2,5})(?:[-&\s]+\d+)*\s+(?:(?:[nsew]|north|south|east|west)\.?\s+)?([a-z][a-z'.]{2,})/gi;
+  let m: RegExpExecArray | null;
+  while ((m = re.exec(text)) !== null) {
+    const num = parseInt(m[1], 10);
+    const street = m[2].toLowerCase().replace(/[^a-z]/g, "");
+    if (street.length >= 4 && !STREET_STOP.has(street)) out.push({ num, street });
+  }
+  return out;
+}
+
+// Match by a building address mentioned in the email (number + street, so
+// streets shared by two associations don't collide).
+function matchAssociationByAddress(text: string, idx: { id: string; num: number; street: string }[]): string | null {
+  for (const p of addressPairs(text)) {
+    for (const e of idx) {
+      if (e.street === p.street && Math.abs(e.num - p.num) <= 50) return e.id;
+    }
+  }
+  return null;
+}
+
 async function getGraphToken(tenant: string, clientId: string, secret: string) {
   const res = await fetch(`https://login.microsoftonline.com/${tenant}/oauth2/v2.0/token`, {
     method: "POST", headers: { "Content-Type": "application/x-www-form-urlencoded" },
@@ -182,9 +208,13 @@ Deno.serve(async (req: Request) => {
 
   const supabase = createClient(Deno.env.get("SUPABASE_URL")!, Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")!);
 
-  const { data: assocData } = await supabase.from("associations").select("id,name,dropbox_folder_path").eq("company_id", companyId);
+  const { data: assocData } = await supabase.from("associations").select("id,name,dropbox_folder_path,address").eq("company_id", companyId);
   const assocs = (assocData ?? []).map((a: any) => ({ id: a.id, nameLower: a.name.toLowerCase(), core: assocCore(a.name) }));
   const folderById = new Map<string, string>((assocData ?? []).filter((a: any) => a.dropbox_folder_path).map((a: any) => [a.id, a.dropbox_folder_path]));
+  const addrIndex: { id: string; num: number; street: string }[] = [];
+  for (const a of (assocData ?? []) as any[]) {
+    if (a.address) for (const p of addressPairs(a.address)) addrIndex.push({ id: a.id, num: p.num, street: p.street });
+  }
 
   const { data: settings } = await supabase.from("agent_settings").select("triage_rules").eq("company_id", companyId).maybeSingle();
   const rules = (settings as any)?.triage_rules || DEFAULT_RULES;
@@ -219,6 +249,7 @@ Deno.serve(async (req: Request) => {
         if (owner) { unitId = (owner as any).unit_id ?? null; associationId = (owner as any).units?.association_id ?? null; }
       }
       if (!associationId) associationId = matchAssociationByText(`${msg.subject ?? ""} ${msg.bodyPreview ?? ""}`, assocs);
+      if (!associationId) associationId = matchAssociationByAddress(`${msg.subject ?? ""} ${msg.bodyPreview ?? ""}`, addrIndex);
 
       const triage = await triageEmail(provider, msg, draftsEnabled, rules);
 
