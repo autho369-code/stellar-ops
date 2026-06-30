@@ -29,12 +29,12 @@ type Triage = { priority: "emergency" | "urgent" | "routine"; isNoise: boolean; 
 const DEFAULT_RULES =
   "PRIORITY rules: emergency = immediate safety or major damage. urgent = water/roof leaks. routine = everything else. Set is_noise=true for marketing/newsletters/promotional/automated notifications.";
 
-function systemPrompt(rules: string, wantDraft: boolean): string {
+function systemPrompt(rules: string, wantDraft: boolean, guidance: string | null): string {
   const base = "You triage email for Stellar Property Group, an HOA/condo manager. " + rules + " ";
   return wantDraft
     ? base +
-        'Return STRICT JSON only: {"priority":"emergency|urgent|routine","is_noise":true|false,"draft":"a concise, professional reply"}. ' +
-        "Keep the draft brief and do not invent facts or commitments."
+        'Return STRICT JSON only: {"priority":"emergency|urgent|routine","is_noise":true|false,"draft":"a reply that follows the DRAFT GUIDELINES"}. ' +
+        "DRAFT GUIDELINES: " + (guidance || "Keep the draft brief and professional; do not invent facts or commitments.")
     : base + 'Return STRICT JSON only: {"priority":"emergency|urgent|routine","is_noise":true|false}.';
 }
 
@@ -75,10 +75,10 @@ async function openaiComplete(system: string, msg: GraphMessage): Promise<string
   return (await res.json()).choices?.[0]?.message?.content ?? "";
 }
 
-async function triageEmail(provider: "anthropic" | "openai" | null, msg: GraphMessage, wantDraft: boolean, rules: string): Promise<Triage> {
+async function triageEmail(provider: "anthropic" | "openai" | null, msg: GraphMessage, wantDraft: boolean, rules: string, guidance: string | null): Promise<Triage> {
   if (!provider) return { priority: "routine", isNoise: false, draft: null, raw: "no-provider" };
   try {
-    const system = systemPrompt(rules, wantDraft);
+    const system = systemPrompt(rules, wantDraft, guidance);
     const text = provider === "anthropic" ? await anthropicComplete(system, msg) : await openaiComplete(system, msg);
     const p = JSON.parse(text.slice(text.indexOf("{"), text.lastIndexOf("}") + 1));
     const priority = ["emergency", "urgent", "routine"].includes(p.priority) ? p.priority : "routine";
@@ -235,8 +235,9 @@ Deno.serve(async (req: Request) => {
   const { data: vEmails } = await supabase.from("vendors").select("name,email").eq("company_id", companyId).not("email", "is", null);
   const vendorByEmail = new Map<string, string>((vEmails ?? []).map((v: any) => [String(v.email).toLowerCase(), v.name]));
 
-  const { data: settings } = await supabase.from("agent_settings").select("triage_rules").eq("company_id", companyId).maybeSingle();
+  const { data: settings } = await supabase.from("agent_settings").select("triage_rules,draft_guidance").eq("company_id", companyId).maybeSingle();
   const rules = (settings as any)?.triage_rules || DEFAULT_RULES;
+  const guidance = (settings as any)?.draft_guidance || null;
 
   const dbxToken = await dropboxToken();
 
@@ -281,7 +282,7 @@ Deno.serve(async (req: Request) => {
             if (vList?.[0]) vendorName = (vList[0] as any).name;
           }
         }
-        const vt = await triageEmail(provider, { ...msg, bodyPreview: oo.preview ?? msg.bodyPreview }, false, rules);
+        const vt = await triageEmail(provider, { ...msg, bodyPreview: oo.preview ?? msg.bodyPreview }, false, rules, guidance);
         const { data: wi } = await supabase.from("work_items").insert({
           company_id: companyId, association_id: aId, unit_id: uId,
           type: "call", title: oo.name ? `Voicemail: ${oo.name}` : (msg.subject || "Voicemail"),
@@ -303,7 +304,7 @@ Deno.serve(async (req: Request) => {
       if (!associationId) associationId = matchAssociationByAddress(`${msg.subject ?? ""} ${msg.bodyPreview ?? ""}`, addrIndex);
       const vendorName = fromAddr ? (vendorByEmail.get(fromAddr.toLowerCase()) ?? null) : null;
 
-      const triage = await triageEmail(provider, msg, draftsEnabled, rules);
+      const triage = await triageEmail(provider, msg, draftsEnabled, rules, guidance);
 
       if (triage.isNoise && !vendorName) {
         await supabase.from("processed_emails").insert({ company_id: companyId, graph_message_id: msg.id, mailbox, subject: msg.subject, from_address: fromAddr, work_item_id: null, draft_created: false });
@@ -321,7 +322,7 @@ Deno.serve(async (req: Request) => {
         company_id: companyId, association_id: associationId, unit_id: unitId,
         type: "email_doc", title: msg.subject || "(no subject)", description: msg.bodyPreview ?? null,
         source_channel: "outlook", priority: triage.priority,
-        metadata: { graph_message_id: msg.id, mailbox, from: fromAddr, web_link: msg.webLink, draft_created: draftCreated, vendor: vendorName, debug: triage.raw },
+        metadata: { graph_message_id: msg.id, mailbox, from: fromAddr, web_link: msg.webLink, draft_created: draftCreated, vendor: vendorName },
       }).select("id").single();
 
       // File document attachments into the association's Dropbox folder.
