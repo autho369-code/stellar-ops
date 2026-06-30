@@ -58,3 +58,22 @@ export async function runAgentNow() {
   revalidatePath("/ops/agent");
   revalidatePath("/ops");
 }
+
+// Read-only "learn the business" pass: samples email + Dropbox history and
+// rebuilds Arthur's knowledge notes. Authenticated as the signed-in user.
+export async function learnNow() {
+  const supabase = await createClient();
+  const {
+    data: { session },
+  } = await supabase.auth.getSession();
+  if (!session) return;
+  await fetch(`${process.env.NEXT_PUBLIC_SUPABASE_URL}/functions/v1/learn-business`, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      Authorization: `Bearer ${session.access_token}`,
+    },
+    body: JSON.stringify({ source: "all" }),
+  }).catch(() => {});
+  revalidatePath("/ops/agent");
+}

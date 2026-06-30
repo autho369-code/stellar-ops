@@ -1,7 +1,7 @@
 import Link from "next/link";
 import { redirect } from "next/navigation";
 import { createClient } from "@/lib/supabase/server";
-import { runAgentNow, saveAgentSettings } from "./actions";
+import { learnNow, runAgentNow, saveAgentSettings } from "./actions";
 
 export const dynamic = "force-dynamic";
 
@@ -37,7 +37,7 @@ export default async function AgentPage() {
   } = await supabase.auth.getUser();
   if (!user) redirect("/login");
 
-  const [{ data: settings }, emails, calls, docs, recognized, totalItems] =
+  const [{ data: settings }, emails, calls, docs, recognized, totalItems, knowledge] =
     await Promise.all([
       supabase.from("agent_settings").select("*").maybeSingle(),
       supabase.from("work_items").select("*", { count: "exact", head: true }).eq("source_channel", "outlook"),
@@ -45,6 +45,7 @@ export default async function AgentPage() {
       supabase.from("documents").select("*", { count: "exact", head: true }),
       supabase.from("work_items").select("*", { count: "exact", head: true }).in("source_channel", ["outlook", "ooma"]).not("association_id", "is", null),
       supabase.from("work_items").select("*", { count: "exact", head: true }).in("source_channel", ["outlook", "ooma"]),
+      supabase.from("knowledge_notes").select("*", { count: "exact", head: true }),
     ]);
 
   const s = (settings as any) ?? {};
@@ -124,6 +125,28 @@ export default async function AgentPage() {
           {s.last_run_at ? ` Last run ${new Date(s.last_run_at).toLocaleString()}.` : ""}
         </span>
       </form>
+
+      {/* Knowledge / learning */}
+      <div className="mb-8 rounded-xl border border-neutral-200 bg-white p-4">
+        <div className="flex flex-wrap items-center justify-between gap-3">
+          <div>
+            <h2 className="text-sm font-semibold text-neutral-800">What {name} has learned</h2>
+            <p className="mt-0.5 text-xs text-neutral-500">
+              {knowledge.count ?? 0} notes from email + Dropbox history.
+              {s.last_learned_at ? ` Last learned ${new Date(s.last_learned_at).toLocaleString()}.` : " Not learned yet."}
+              {" "}Ask him in chat, e.g. &ldquo;what do you know about Lincoln Park?&rdquo;
+            </p>
+          </div>
+          <form action={learnNow}>
+            <button className="rounded-lg border border-neutral-300 px-3 py-1.5 text-sm font-medium text-neutral-700 transition hover:bg-neutral-50">
+              Learn now
+            </button>
+          </form>
+        </div>
+        <p className="mt-2 text-xs text-neutral-400">
+          Read-only: samples recent email and lists Dropbox folders to build a factual snapshot. Re-run after big changes. (Takes a minute.)
+        </p>
+      </div>
 
       <form action={saveAgentSettings} className="space-y-8">
         {/* Identity */}
