@@ -80,6 +80,12 @@ export default async function OpsDashboard({
         </div>
         <div className="flex items-center gap-3">
           <Link
+            href="/ops/agent"
+            className="rounded-lg border border-neutral-300 px-3 py-1.5 text-sm font-medium text-neutral-600 transition hover:bg-neutral-50"
+          >
+            Agent
+          </Link>
+          <Link
             href="/ops/recurring"
             className="rounded-lg border border-neutral-300 px-3 py-1.5 text-sm font-medium text-neutral-600 transition hover:bg-neutral-50"
           >
