@@ -270,20 +270,23 @@ async function llmText(provider: "anthropic" | "openai", system: string, user: s
   return (await res.json()).choices?.[0]?.message?.content ?? "";
 }
 
-// Choose the existing subfolder an attachment belongs in, matched against the
-// association's REAL folder list. Returns null to leave it in the catch-all.
+// Standard folders we'll create when an association has no matching folder.
+const STANDARD_FOLDERS = ["Insurance", "Violations", "Legal", "Budgets", "Meeting Minutes", "Notices", "Invoices", "Estimates and Proposals", "Unit Files", "Sales Packet", "Corporate & Annual Reports", "Tax Returns", "Photos", "Maintenance", "Contracts", "Correspondence"];
+
+// Choose the folder an attachment belongs in: prefer an existing subfolder,
+// else a standard category (which Dropbox creates on upload). null = no home.
 async function classifyToSubfolder(provider: "anthropic" | "openai" | null, subject: string, filename: string, subfolders: string[]): Promise<string | null> {
-  if (!provider || subfolders.length === 0) return null;
-  const system = "You file property-management documents into the correct EXISTING folder. Reply with ONLY the exact folder name from the list that best fits this document, or the single word NONE if nothing clearly fits. Output nothing else.";
-  const user = `Email subject: ${subject || "(none)"}\nAttachment filename: ${filename}\n\nFolders:\n${subfolders.join("\n")}`;
+  if (!provider) return null;
+  const system = "You file property-management documents into a folder. Prefer an EXACT existing folder. If none fits, pick the best STANDARD category (it will be created). Reply with ONLY the folder name, or NONE if truly nothing applies. Output nothing else.";
+  const user = `Email subject: ${subject || "(none)"}\nAttachment filename: ${filename}\n\nEXISTING folders:\n${subfolders.join("\n") || "(none)"}\n\nSTANDARD categories (only if no existing folder fits):\n${STANDARD_FOLDERS.join("\n")}`;
   try {
     const out = (await llmText(provider, system, user)).trim().replace(/^["']|["']$/g, "");
     if (/^none$/i.test(out) || !out) return null;
-    return (
-      subfolders.find((s) => s.toLowerCase() === out.toLowerCase()) ??
-      subfolders.find((s) => s.length > 4 && out.toLowerCase().includes(s.toLowerCase())) ??
-      null
-    );
+    const existing = subfolders.find((s) => s.toLowerCase() === out.toLowerCase()) ?? subfolders.find((s) => s.length > 4 && out.toLowerCase().includes(s.toLowerCase()));
+    if (existing) return existing;
+    const std = STANDARD_FOLDERS.find((s) => s.toLowerCase() === out.toLowerCase()) ?? STANDARD_FOLDERS.find((s) => out.toLowerCase().includes(s.toLowerCase()));
+    if (std) return std;
+    return /^[A-Za-z0-9 &()\-]{3,40}$/.test(out) ? out : null; // accept a clean new name
   } catch (_) {
     return null;
   }

@@ -103,6 +103,12 @@ export default async function OpsDashboard({
             Agent
           </Link>
           <Link
+            href="/ops/documents"
+            className="rounded-lg border border-neutral-300 px-3 py-1.5 text-sm font-medium text-neutral-600 transition hover:bg-neutral-50"
+          >
+            Documents
+          </Link>
+          <Link
             href="/ops/recurring"
             className="rounded-lg border border-neutral-300 px-3 py-1.5 text-sm font-medium text-neutral-600 transition hover:bg-neutral-50"
           >
