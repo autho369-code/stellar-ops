@@ -2,6 +2,7 @@ import Link from "next/link";
 import { redirect } from "next/navigation";
 import { createClient } from "@/lib/supabase/server";
 import { addObligation, generateNow } from "./actions";
+import { ImportCalendar } from "./ImportCalendar";
 
 export const dynamic = "force-dynamic";
 
@@ -65,6 +66,8 @@ export default async function RecurringPage() {
           </button>
         </form>
       </header>
+
+      <ImportCalendar />
 
       <div className="overflow-hidden rounded-xl border border-neutral-200 bg-white">
         <table className="w-full text-sm">
