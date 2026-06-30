@@ -29,8 +29,11 @@ type Triage = { priority: "emergency" | "urgent" | "routine"; isNoise: boolean; 
 const DEFAULT_RULES =
   "PRIORITY rules: emergency = immediate safety or major damage. urgent = water/roof leaks. routine = everything else. Set is_noise=true for marketing/newsletters/promotional/automated notifications.";
 
-function systemPrompt(rules: string, wantDraft: boolean, guidance: string | null): string {
-  const base = "You triage email for Stellar Property Group, an HOA/condo manager. " + rules + " ";
+function systemPrompt(rules: string, wantDraft: boolean, guidance: string | null, name: string, persona: string | null): string {
+  const identity =
+    "You are " + (name || "Arthur") + ", the operations assistant for Stellar Property Group, an HOA/condo manager. " +
+    (persona ? persona + " " : "");
+  const base = identity + "Triage this email. " + rules + " ";
   return wantDraft
     ? base +
         'Return STRICT JSON only: {"priority":"emergency|urgent|routine","is_noise":true|false,"draft":"a reply that follows the DRAFT GUIDELINES"}. ' +
@@ -75,10 +78,10 @@ async function openaiComplete(system: string, msg: GraphMessage): Promise<string
   return (await res.json()).choices?.[0]?.message?.content ?? "";
 }
 
-async function triageEmail(provider: "anthropic" | "openai" | null, msg: GraphMessage, wantDraft: boolean, rules: string, guidance: string | null): Promise<Triage> {
+async function triageEmail(provider: "anthropic" | "openai" | null, msg: GraphMessage, wantDraft: boolean, rules: string, guidance: string | null, name: string, persona: string | null): Promise<Triage> {
   if (!provider) return { priority: "routine", isNoise: false, draft: null, raw: "no-provider" };
   try {
-    const system = systemPrompt(rules, wantDraft, guidance);
+    const system = systemPrompt(rules, wantDraft, guidance, name, persona);
     const text = provider === "anthropic" ? await anthropicComplete(system, msg) : await openaiComplete(system, msg);
     const p = JSON.parse(text.slice(text.indexOf("{"), text.lastIndexOf("}") + 1));
     const priority = ["emergency", "urgent", "routine"].includes(p.priority) ? p.priority : "routine";
@@ -143,6 +146,38 @@ function phoneFragment(num: string | null): string | null {
   if (d.length < 7) return null;
   const l = d.slice(-7);
   return l.slice(0, 3) + "-" + l.slice(3);
+}
+
+// Current hour (0-23) and ISO weekday (Mon=1..Sun=7) in the agent's timezone.
+function localNow(tz: string): { hour: number; weekday: number } {
+  const parts = new Intl.DateTimeFormat("en-US", { timeZone: tz || "America/Chicago", hour: "2-digit", hour12: false, weekday: "short" }).formatToParts(new Date());
+  let hour = parseInt(parts.find((p) => p.type === "hour")?.value ?? "0", 10);
+  if (hour === 24) hour = 0;
+  const map: Record<string, number> = { Sun: 7, Mon: 1, Tue: 2, Wed: 3, Thu: 4, Fri: 5, Sat: 6 };
+  const weekday = map[parts.find((p) => p.type === "weekday")?.value ?? "Mon"] ?? 1;
+  return { hour, weekday };
+}
+
+// Decide whether this run should be skipped, based on the editable schedule in
+// agent_settings (active hours/days + interval, with a separate overnight
+// interval that can be 0 = paused). "Run now" bypasses this.
+function scheduleGate(s: any): { skip: boolean; reason: string } {
+  const tz = s.schedule_tz || "America/Chicago";
+  const start = Number.isFinite(s.active_start_hour) ? s.active_start_hour : 7;
+  const end = Number.isFinite(s.active_end_hour) ? s.active_end_hour : 19;
+  const activeInt = Number.isFinite(s.active_interval_min) ? s.active_interval_min : 15;
+  const quietInt = Number.isFinite(s.quiet_interval_min) ? s.quiet_interval_min : 0;
+  const days = String(s.active_days ?? "1,2,3,4,5,6,7").split(",").map((d: string) => parseInt(d.trim(), 10)).filter((n: number) => n >= 1 && n <= 7);
+  const { hour, weekday } = localNow(tz);
+  const dayOk = days.length === 0 || days.includes(weekday);
+  const hourOk = end > start ? (hour >= start && hour < end) : (hour >= start || hour < end);
+  const isActive = dayOk && hourOk;
+  const interval = isActive ? activeInt : quietInt;
+  if (interval <= 0) return { skip: true, reason: isActive ? "interval-zero" : "quiet-hours" };
+  const last = s.last_run_at ? new Date(s.last_run_at).getTime() : 0;
+  const elapsedMin = last ? (Date.now() - last) / 60000 : Infinity;
+  if (elapsedMin < interval - 1) return { skip: true, reason: "interval-not-elapsed" };
+  return { skip: false, reason: isActive ? "active" : "quiet-active" };
 }
 
 async function getGraphToken(tenant: string, clientId: string, secret: string) {
@@ -235,9 +270,20 @@ Deno.serve(async (req: Request) => {
   const { data: vEmails } = await supabase.from("vendors").select("name,email").eq("company_id", companyId).not("email", "is", null);
   const vendorByEmail = new Map<string, string>((vEmails ?? []).map((v: any) => [String(v.email).toLowerCase(), v.name]));
 
-  const { data: settings } = await supabase.from("agent_settings").select("triage_rules,draft_guidance").eq("company_id", companyId).maybeSingle();
-  const rules = (settings as any)?.triage_rules || DEFAULT_RULES;
-  const guidance = (settings as any)?.draft_guidance || null;
+  const { data: settings } = await supabase.from("agent_settings").select("triage_rules,draft_guidance,agent_name,persona,schedule_tz,active_start_hour,active_end_hour,active_interval_min,quiet_interval_min,active_days,last_run_at").eq("company_id", companyId).maybeSingle();
+  const s = (settings as any) ?? {};
+  const rules = s.triage_rules || DEFAULT_RULES;
+  const guidance = s.draft_guidance || null;
+  const agentName = s.agent_name || "Arthur";
+  const persona = s.persona || null;
+
+  // Schedule gate: honor the editable active hours / interval unless forced.
+  let force = false;
+  try { force = (await req.clone().json())?.force === true; } catch (_) { /* no body (cron tick) */ }
+  const gate = scheduleGate(s);
+  if (!force && gate.skip) {
+    return new Response(JSON.stringify({ agent: agentName, skipped: gate.reason, at: new Date().toISOString() }), { headers: { "Content-Type": "application/json" } });
+  }
 
   const dbxToken = await dropboxToken();
 
@@ -282,7 +328,7 @@ Deno.serve(async (req: Request) => {
             if (vList?.[0]) vendorName = (vList[0] as any).name;
           }
         }
-        const vt = await triageEmail(provider, { ...msg, bodyPreview: oo.preview ?? msg.bodyPreview }, false, rules, guidance);
+        const vt = await triageEmail(provider, { ...msg, bodyPreview: oo.preview ?? msg.bodyPreview }, false, rules, guidance, agentName, persona);
         const { data: wi } = await supabase.from("work_items").insert({
           company_id: companyId, association_id: aId, unit_id: uId,
           type: "call", title: oo.name ? `Voicemail: ${oo.name}` : (msg.subject || "Voicemail"),
@@ -304,7 +350,7 @@ Deno.serve(async (req: Request) => {
       if (!associationId) associationId = matchAssociationByAddress(`${msg.subject ?? ""} ${msg.bodyPreview ?? ""}`, addrIndex);
       const vendorName = fromAddr ? (vendorByEmail.get(fromAddr.toLowerCase()) ?? null) : null;
 
-      const triage = await triageEmail(provider, msg, draftsEnabled, rules, guidance);
+      const triage = await triageEmail(provider, msg, draftsEnabled, rules, guidance, agentName, persona);
 
       if (triage.isNoise && !vendorName) {
         await supabase.from("processed_emails").insert({ company_id: companyId, graph_message_id: msg.id, mailbox, subject: msg.subject, from_address: fromAddr, work_item_id: null, draft_created: false });
@@ -361,5 +407,7 @@ Deno.serve(async (req: Request) => {
     }
   }
 
-  return new Response(JSON.stringify({ configured: true, provider: provider ?? "none", drafts_enabled: draftsEnabled, dropbox: Boolean(dbxToken), mailboxes: mailboxes.length, created, calls, noise, drafted, filed, skipped, at: new Date().toISOString() }), { headers: { "Content-Type": "application/json" } });
+  await supabase.from("agent_settings").update({ last_run_at: new Date().toISOString() }).eq("company_id", companyId);
+
+  return new Response(JSON.stringify({ agent: agentName, configured: true, forced: force, provider: provider ?? "none", drafts_enabled: draftsEnabled, dropbox: Boolean(dbxToken), mailboxes: mailboxes.length, created, calls, noise, drafted, filed, skipped, at: new Date().toISOString() }), { headers: { "Content-Type": "application/json" } });
 });

@@ -3,11 +3,14 @@
 import { revalidatePath } from "next/cache";
 import { createClient } from "@/lib/supabase/server";
 
-// Save the agent's triage rules and draft voice (read live by the edge agent).
-export async function saveAgentSettings(formData: FormData) {
-  const triage_rules = String(formData.get("triage_rules") ?? "").trim();
-  const draft_guidance = String(formData.get("draft_guidance") ?? "").trim();
+function intOr(v: FormDataEntryValue | null, fallback: number): number {
+  const n = parseInt(String(v ?? ""), 10);
+  return Number.isFinite(n) ? n : fallback;
+}
 
+// Save Arthur's identity, schedule, triage rules and draft voice.
+// All of it is read live by the edge agent on its next run — no redeploy.
+export async function saveAgentSettings(formData: FormData) {
   const supabase = await createClient();
   const {
     data: { user },
@@ -15,20 +18,42 @@ export async function saveAgentSettings(formData: FormData) {
   const companyId = user?.app_metadata?.company_id as string | undefined;
   if (!companyId) return;
 
-  await supabase
-    .from("agent_settings")
-    .upsert(
-      { company_id: companyId, triage_rules, draft_guidance, updated_at: new Date().toISOString() },
-      { onConflict: "company_id" },
-    );
+  // Days are individual checkboxes (ISO weekday 1=Mon..7=Sun).
+  const days = formData
+    .getAll("active_days")
+    .map((d) => parseInt(String(d), 10))
+    .filter((n) => n >= 1 && n <= 7)
+    .sort((a, b) => a - b);
+
+  await supabase.from("agent_settings").upsert(
+    {
+      company_id: companyId,
+      agent_name: String(formData.get("agent_name") ?? "Arthur").trim() || "Arthur",
+      persona: String(formData.get("persona") ?? "").trim() || null,
+      schedule_tz: String(formData.get("schedule_tz") ?? "America/Chicago").trim() || "America/Chicago",
+      active_start_hour: intOr(formData.get("active_start_hour"), 7),
+      active_end_hour: intOr(formData.get("active_end_hour"), 19),
+      active_interval_min: intOr(formData.get("active_interval_min"), 15),
+      quiet_interval_min: intOr(formData.get("quiet_interval_min"), 0),
+      active_days: (days.length ? days : [1, 2, 3, 4, 5, 6, 7]).join(","),
+      triage_rules: String(formData.get("triage_rules") ?? "").trim(),
+      draft_guidance: String(formData.get("draft_guidance") ?? "").trim(),
+      updated_at: new Date().toISOString(),
+    },
+    { onConflict: "company_id" },
+  );
   revalidatePath("/ops/agent");
 }
 
-// Trigger an immediate agent run (otherwise it runs every 15 min on schedule).
+// Trigger an immediate run, bypassing the schedule gate (force: true).
 export async function runAgentNow() {
   await fetch(`${process.env.NEXT_PUBLIC_SUPABASE_URL}/functions/v1/ingest-outlook`, {
     method: "POST",
-    headers: { Authorization: `Bearer ${process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY}` },
+    headers: {
+      "Content-Type": "application/json",
+      Authorization: `Bearer ${process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY}`,
+    },
+    body: JSON.stringify({ force: true }),
   }).catch(() => {});
   revalidatePath("/ops/agent");
   revalidatePath("/ops");
