@@ -2,6 +2,7 @@ import Link from "next/link";
 import { redirect } from "next/navigation";
 import { createClient } from "@/lib/supabase/server";
 import { learnNow, runAgentNow, saveAgentSettings } from "./actions";
+import { isAdmin } from "@/lib/isAdmin";
 
 export const dynamic = "force-dynamic";
 
@@ -36,6 +37,8 @@ export default async function AgentPage() {
     data: { user },
   } = await supabase.auth.getUser();
   if (!user) redirect("/login");
+
+  const admin = await isAdmin(supabase, user.id);
 
   const [{ data: settings }, emails, calls, docs, recognized, totalItems, knowledge] =
     await Promise.all([
@@ -115,16 +118,25 @@ export default async function AgentPage() {
         {stat("Recognized", `${pct}%`)}
       </div>
 
+      {/* Admin-only banner */}
+      {!admin && (
+        <div className="mb-6 rounded-lg border border-neutral-200 bg-neutral-50 px-4 py-2.5 text-xs text-neutral-600">
+          🔒 Arthur&apos;s identity, schedule, and rules are locked to the admin. You can still chat with him and work your queue.
+        </div>
+      )}
+
       {/* Run now */}
-      <form action={runAgentNow} className="mb-8">
-        <button className="rounded-lg border border-neutral-300 px-3 py-1.5 text-sm font-medium text-neutral-700 transition hover:bg-neutral-50">
-          Run now
-        </button>
-        <span className="ml-3 text-xs text-neutral-400">
-          Forces an immediate pass, even outside active hours.
-          {s.last_run_at ? ` Last run ${new Date(s.last_run_at).toLocaleString()}.` : ""}
-        </span>
-      </form>
+      {admin && (
+        <form action={runAgentNow} className="mb-8">
+          <button className="rounded-lg border border-neutral-300 px-3 py-1.5 text-sm font-medium text-neutral-700 transition hover:bg-neutral-50">
+            Run now
+          </button>
+          <span className="ml-3 text-xs text-neutral-400">
+            Forces an immediate pass, even outside active hours.
+            {s.last_run_at ? ` Last run ${new Date(s.last_run_at).toLocaleString()}.` : ""}
+          </span>
+        </form>
+      )}
 
       {/* Knowledge / learning */}
       <div className="mb-8 rounded-xl border border-neutral-200 bg-white p-4">
@@ -137,17 +149,20 @@ export default async function AgentPage() {
               {" "}Ask him in chat, e.g. &ldquo;what do you know about Lincoln Park?&rdquo;
             </p>
           </div>
-          <form action={learnNow}>
-            <button className="rounded-lg border border-neutral-300 px-3 py-1.5 text-sm font-medium text-neutral-700 transition hover:bg-neutral-50">
-              Learn now
-            </button>
-          </form>
+          {admin && (
+            <form action={learnNow}>
+              <button className="rounded-lg border border-neutral-300 px-3 py-1.5 text-sm font-medium text-neutral-700 transition hover:bg-neutral-50">
+                Learn now
+              </button>
+            </form>
+          )}
         </div>
         <p className="mt-2 text-xs text-neutral-400">
           Read-only: samples recent email and lists Dropbox folders to build a factual snapshot. Re-run after big changes. (Takes a minute.)
         </p>
       </div>
 
+      {admin && (
       <form action={saveAgentSettings} className="space-y-8">
         {/* Identity */}
         <section className="space-y-3">
@@ -241,6 +256,7 @@ export default async function AgentPage() {
           <span className="text-xs text-neutral-400">Takes effect on the next run — no deploy needed.</span>
         </div>
       </form>
+      )}
     </main>
   );
 }

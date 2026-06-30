@@ -2,6 +2,7 @@
 
 import { revalidatePath } from "next/cache";
 import { createClient } from "@/lib/supabase/server";
+import { isAdmin } from "@/lib/isAdmin";
 
 function intOr(v: FormDataEntryValue | null, fallback: number): number {
   const n = parseInt(String(v ?? ""), 10);
@@ -16,7 +17,8 @@ export async function saveAgentSettings(formData: FormData) {
     data: { user },
   } = await supabase.auth.getUser();
   const companyId = user?.app_metadata?.company_id as string | undefined;
-  if (!companyId) return;
+  if (!companyId || !user) return;
+  if (!(await isAdmin(supabase, user.id))) return; // admin-only
 
   // Days are individual checkboxes (ISO weekday 1=Mon..7=Sun).
   const days = formData
@@ -47,6 +49,11 @@ export async function saveAgentSettings(formData: FormData) {
 
 // Trigger an immediate run, bypassing the schedule gate (force: true).
 export async function runAgentNow() {
+  const supabase = await createClient();
+  const {
+    data: { user },
+  } = await supabase.auth.getUser();
+  if (!user || !(await isAdmin(supabase, user.id))) return; // admin-only
   await fetch(`${process.env.NEXT_PUBLIC_SUPABASE_URL}/functions/v1/ingest-outlook`, {
     method: "POST",
     headers: {
@@ -67,6 +74,7 @@ export async function learnNow() {
     data: { session },
   } = await supabase.auth.getSession();
   if (!session) return;
+  if (!(await isAdmin(supabase, session.user.id))) return; // admin-only
   await fetch(`${process.env.NEXT_PUBLIC_SUPABASE_URL}/functions/v1/learn-business`, {
     method: "POST",
     headers: {
