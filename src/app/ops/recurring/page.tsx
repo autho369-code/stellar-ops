@@ -1,8 +1,9 @@
 import Link from "next/link";
 import { redirect } from "next/navigation";
 import { createClient } from "@/lib/supabase/server";
-import { addObligation, generateNow } from "./actions";
+import { addObligation } from "./actions";
 import { ImportCalendar } from "./ImportCalendar";
+import { GenerateButton } from "./GenerateButton";
 
 export const dynamic = "force-dynamic";
 
@@ -60,11 +61,7 @@ export default async function RecurringPage() {
             Inspections, renewals, and rodding — auto-added to the queue before they’re due.
           </p>
         </div>
-        <form action={generateNow}>
-          <button className="rounded-lg bg-neutral-900 px-3 py-1.5 text-sm font-medium text-white transition hover:bg-neutral-800">
-            Generate due items now
-          </button>
-        </form>
+        <GenerateButton />
       </header>
 
       <ImportCalendar />

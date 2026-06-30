@@ -36,11 +36,12 @@ function parseDate(s: string): string | null {
 }
 
 // Runs the generator for the caller's company (same RPC the cron uses).
-export async function generateNow() {
+export async function generateNow(): Promise<{ count: number; error: string | null }> {
   const supabase = await createClient();
-  await supabase.rpc("generate_due_recurring", { p_company: null });
+  const { data, error } = await supabase.rpc("generate_due_recurring", { p_company: null });
   revalidatePath("/ops/recurring");
   revalidatePath("/ops");
+  return { count: typeof data === "number" ? data : 0, error: error?.message ?? null };
 }
 
 export async function addObligation(formData: FormData) {
