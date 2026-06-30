@@ -45,23 +45,28 @@ async function callOpenai(system: string, msgs: Msg[]): Promise<string> {
 // A compact, live snapshot of the queues so Arthur can answer real questions.
 async function buildContext(supabase: any, companyId: string): Promise<string> {
   const nowIso = new Date().toISOString();
-  const [assoc, recent, openC, overdueC, emergC, draftC] = await Promise.all([
+  const [assoc, team, recent, openC, overdueC, emergC, draftC] = await Promise.all([
     supabase.from("associations").select("id,name").eq("company_id", companyId),
-    supabase.from("work_items").select("id,title,type,priority,status,source_channel,association_id,due_date,created_at,metadata").eq("company_id", companyId).order("created_at", { ascending: false }).limit(30),
+    supabase.from("team_members").select("id,name").eq("company_id", companyId).eq("active", true).order("name"),
+    supabase.from("work_items").select("id,title,type,priority,status,source_channel,association_id,assigned_to,due_date,created_at,metadata").eq("company_id", companyId).order("created_at", { ascending: false }).limit(30),
     supabase.from("work_items").select("*", { count: "exact", head: true }).eq("company_id", companyId).is("owner_user_id", null).eq("status", "open"),
     supabase.from("work_items").select("*", { count: "exact", head: true }).eq("company_id", companyId).lt("due_date", nowIso).neq("status", "done"),
     supabase.from("work_items").select("*", { count: "exact", head: true }).eq("company_id", companyId).eq("priority", "emergency").neq("status", "done"),
     supabase.from("work_items").select("*", { count: "exact", head: true }).eq("company_id", companyId).eq("status", "open").contains("metadata", { draft_created: true }),
   ]);
   const names = new Map<string, string>((assoc.data ?? []).map((a: any) => [a.id, a.name]));
+  const teamById = new Map<string, string>((team.data ?? []).map((t: any) => [t.id, t.name]));
   const lines = (recent.data ?? []).map((w: any) => {
     const who = w.association_id ? names.get(w.association_id) ?? "unrecognized" : "unrecognized";
     const drafted = w.metadata?.draft_created ? ", draft ready" : "";
-    return `- id=${w.id} [${w.priority}/${w.status}] ${w.title} (${w.source_channel}, ${who}${drafted})`;
+    const assignee = w.assigned_to ? `, assigned to ${teamById.get(w.assigned_to) ?? "someone"}` : "";
+    return `- id=${w.id} [${w.priority}/${w.status}] ${w.title} (${w.source_channel}, ${who}${drafted}${assignee})`;
   }).join("\n");
+  const roster = (team.data ?? []).map((t: any) => `- id=${t.id} ${t.name}`).join("\n");
   return (
     "OPERATIONS CONTEXT (live snapshot):\n" +
     `Unclaimed open items: ${openC.count ?? 0} | Overdue: ${overdueC.count ?? 0} | Open emergencies: ${emergC.count ?? 0} | Drafts waiting in Outlook: ${draftC.count ?? 0}\n` +
+    "TEAM (assignable):\n" + (roster || "(none)") + "\n\n" +
     "Recent items (newest first):\n" + (lines || "(nothing yet)")
   );
 }
@@ -94,11 +99,13 @@ Deno.serve(async (req: Request) => {
     "You are chatting with Stellar staff inside the internal operations hub. Use the live OPERATIONS CONTEXT below to answer questions about what has come in, what is urgent or overdue, to summarize voicemails and emails, and to draft replies when asked. " +
     "Be concise, practical, and specific. " +
     "Never invent facts, dates, names, unit numbers, or commitments that are not supported by the context.\n\n" +
-    "ACTIONS: You may propose ONE action on a specific item from the context when the staff member clearly asks you to take/claim it, change its status, or change its priority. " +
+    "ACTIONS: You may propose ONE action covering one or more items from the context when the staff member clearly asks you to take/claim, assign, change status, or change priority. " +
     "To propose, end your message with a single line exactly like:\n" +
-    '@@ACTION {"kind":"set_status","item":"<id from context>","value":"done","summary":"Mark <title> done"}@@\n' +
-    "Allowed: kind=set_status with value in [open,in_progress,escalated,done]; kind=set_priority with value in [emergency,urgent,routine]; kind=claim (no value, assigns the item to this staff member). " +
-    "Use the exact id= value shown in the context. Phrase your sentence as a proposal (e.g. 'Want me to mark it done?') because the staff member must confirm before it runs. Propose at most one action per reply. " +
+    '@@ACTION {"kind":"set_status","items":["<id>","<id>"],"value":"done","summary":"Mark 2 items done"}@@\n' +
+    "Allowed kinds: set_status (value in [open,in_progress,escalated,done]); set_priority (value in [emergency,urgent,routine]); claim (no value — assigns to the signed-in staff member); assign (value = a TEAM id from the roster — assigns to that teammate). " +
+    "`items` is an array of the exact id= values from the context; include every item the request covers (this is how bulk actions work — e.g. all the duplicate requests). " +
+    "Phrase your sentence as a proposal (e.g. 'Want me to assign all 3 to Amina?') because the staff member must confirm before it runs. One action kind per reply. " +
+    "When assigning to a person, match the name to a TEAM id from the roster; if the name is not on the roster, say so instead of guessing. " +
     "You CANNOT send or finalize emails — drafts are reviewed and sent by a person from Outlook; if asked to send, say so.\n\n" +
     context;
 
@@ -108,13 +115,16 @@ Deno.serve(async (req: Request) => {
     let reply = provider === "anthropic" ? await callAnthropic(system, messages) : await callOpenai(system, messages);
 
     // Pull out an optional @@ACTION {...}@@ proposal; the hub confirms + runs it.
-    let proposal: { kind: string; item: string; value: string | null; summary: string } | null = null;
+    let proposal: { kind: string; items: string[]; value: string | null; summary: string } | null = null;
     const m = reply.match(/@@ACTION\s*(\{[\s\S]*?\})\s*@@/);
     if (m) {
       try {
         const a = JSON.parse(m[1]);
-        if (a && typeof a.item === "string" && ["set_status", "set_priority", "claim"].includes(a.kind)) {
-          proposal = { kind: a.kind, item: a.item, value: typeof a.value === "string" ? a.value : null, summary: typeof a.summary === "string" ? a.summary : "" };
+        const items: string[] = Array.isArray(a.items)
+          ? a.items.filter((x: unknown) => typeof x === "string")
+          : (typeof a.item === "string" ? [a.item] : []);
+        if (items.length && ["set_status", "set_priority", "claim", "assign"].includes(a.kind)) {
+          proposal = { kind: a.kind, items, value: typeof a.value === "string" ? a.value : null, summary: typeof a.summary === "string" ? a.summary : "" };
         }
       } catch (_) { /* ignore malformed proposals */ }
       reply = reply.replace(m[0], "").trim();

@@ -9,7 +9,7 @@ import type { WorkItem } from "./_components/types";
 export const dynamic = "force-dynamic";
 
 const WORK_ITEM_COLUMNS =
-  "id, type, title, description, source_channel, status, priority, owner_user_id, association_id, due_date, created_at, metadata";
+  "id, type, title, description, source_channel, status, priority, owner_user_id, association_id, assigned_to, due_date, created_at, metadata";
 
 export default async function OpsDashboard({
   searchParams,
@@ -34,6 +34,10 @@ export default async function OpsDashboard({
   const associationNames = new Map(
     (associations ?? []).map((a) => [a.id, a.name]),
   );
+
+  // Roster for showing who each item is assigned to.
+  const { data: team } = await supabase.from("team_members").select("id, name");
+  const teamNames = new Map((team ?? []).map((t) => [t.id, t.name]));
 
   // `any` here intentionally: the Supabase builder's generics overflow the
   // type checker when composed in a helper. Results are cast back below.
@@ -111,6 +115,7 @@ export default async function OpsDashboard({
           title="Incoming"
           items={(incoming.data as WorkItem[]) ?? []}
           associationNames={associationNames}
+          teamNames={teamNames}
           currentUserId={user.id}
           emptyText="Inbox clear — nothing waiting to be claimed."
         />
@@ -118,6 +123,7 @@ export default async function OpsDashboard({
           title="My Queue"
           items={(myQueue.data as WorkItem[]) ?? []}
           associationNames={associationNames}
+          teamNames={teamNames}
           currentUserId={user.id}
           emptyText="Nothing assigned to you."
         />
@@ -126,6 +132,7 @@ export default async function OpsDashboard({
           accent="red"
           items={(overdue.data as WorkItem[]) ?? []}
           associationNames={associationNames}
+          teamNames={teamNames}
           currentUserId={user.id}
           emptyText="Nothing overdue. "
         />
@@ -134,6 +141,7 @@ export default async function OpsDashboard({
           accent="red"
           items={(emergencies.data as WorkItem[]) ?? []}
           associationNames={associationNames}
+          teamNames={teamNames}
           currentUserId={user.id}
           emptyText="No emergencies."
         />

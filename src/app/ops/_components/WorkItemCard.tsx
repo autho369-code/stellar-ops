@@ -33,10 +33,12 @@ function dueLabel(due: string | null): { text: string; overdue: boolean } {
 export function WorkItemCard({
   item,
   associationName,
+  assigneeName,
   isMine,
 }: {
   item: WorkItem;
   associationName?: string;
+  assigneeName?: string;
   isMine: boolean;
 }) {
   const due = dueLabel(item.due_date);
@@ -72,6 +74,14 @@ export function WorkItemCard({
         <span className={due.overdue ? "font-medium text-red-600" : ""}>
           {due.text}
         </span>
+        {assigneeName && (
+          <>
+            <span>·</span>
+            <span className="rounded-full bg-blue-50 px-2 py-0.5 font-medium text-blue-700">
+              {assigneeName}
+            </span>
+          </>
+        )}
       </div>
 
       {(item.metadata?.web_link || item.metadata?.draft_created) && (

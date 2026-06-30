@@ -4,7 +4,7 @@ import { revalidatePath } from "next/cache";
 import { createClient } from "@/lib/supabase/server";
 
 export type ChatMsg = { role: "user" | "assistant"; content: string };
-export type Proposal = { kind: string; item: string; value: string | null; summary: string };
+export type Proposal = { kind: string; items: string[]; value: string | null; summary: string };
 
 // Forward the conversation to Arthur's chat function, authenticated as the
 // signed-in staff member (the function requires a valid JWT).
@@ -43,7 +43,9 @@ export async function runAction(p: Proposal): Promise<{ ok: boolean; message: st
     data: { user },
   } = await supabase.auth.getUser();
   if (!user) return { ok: false, message: "You are signed out." };
-  if (!p?.item) return { ok: false, message: "No item specified." };
+
+  const items = (p?.items ?? []).filter((x) => typeof x === "string" && x);
+  if (!items.length) return { ok: false, message: "No items specified." };
 
   const patch: Record<string, unknown> = {};
   if (p.kind === "set_status" && STATUS.includes(p.value ?? "")) {
@@ -55,6 +57,12 @@ export async function runAction(p: Proposal): Promise<{ ok: boolean; message: st
   } else if (p.kind === "claim") {
     patch.owner_user_id = user.id;
     patch.status = "in_progress";
+  } else if (p.kind === "assign") {
+    if (!p.value) return { ok: false, message: "No teammate specified." };
+    // RLS scopes this to the caller's company, so a valid row means it's theirs.
+    const { data: tm } = await supabase.from("team_members").select("id").eq("id", p.value).maybeSingle();
+    if (!tm) return { ok: false, message: "That teammate isn't on the roster." };
+    patch.assigned_to = tm.id;
   } else {
     return { ok: false, message: "That action isn't allowed." };
   }
@@ -62,13 +70,19 @@ export async function runAction(p: Proposal): Promise<{ ok: boolean; message: st
   const { data, error } = await supabase
     .from("work_items")
     .update(patch)
-    .eq("id", p.item)
-    .select("id")
-    .maybeSingle();
+    .in("id", items)
+    .select("id");
 
   if (error) return { ok: false, message: error.message };
-  if (!data) return { ok: false, message: "Couldn't find that item (it may belong to another association or was already removed)." };
+  const n = data?.length ?? 0;
+  if (!n) return { ok: false, message: "Couldn't find those items (they may belong to another association or were already removed)." };
 
   revalidatePath("/ops");
-  return { ok: true, message: "Done — updated in the queue." };
+  return {
+    ok: true,
+    message:
+      n === items.length
+        ? `Done — updated ${n} item${n === 1 ? "" : "s"}.`
+        : `Updated ${n} of ${items.length} (the rest weren't found).`,
+  };
 }

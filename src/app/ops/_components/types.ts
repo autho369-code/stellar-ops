@@ -8,6 +8,7 @@ export type WorkItem = {
   priority: "emergency" | "urgent" | "routine";
   owner_user_id: string | null;
   association_id: string | null;
+  assigned_to: string | null;
   due_date: string | null;
   created_at: string;
   metadata: {

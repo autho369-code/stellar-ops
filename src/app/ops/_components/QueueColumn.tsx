@@ -6,6 +6,7 @@ export function QueueColumn({
   accent,
   items,
   associationNames,
+  teamNames,
   currentUserId,
   emptyText,
 }: {
@@ -13,6 +14,7 @@ export function QueueColumn({
   accent?: "red";
   items: WorkItem[];
   associationNames: Map<string, string>;
+  teamNames: Map<string, string>;
   currentUserId: string;
   emptyText: string;
 }) {
@@ -45,6 +47,9 @@ export function QueueColumn({
                 item.association_id
                   ? associationNames.get(item.association_id)
                   : undefined
+              }
+              assigneeName={
+                item.assigned_to ? teamNames.get(item.assigned_to) : undefined
               }
               isMine={item.owner_user_id === currentUserId}
             />

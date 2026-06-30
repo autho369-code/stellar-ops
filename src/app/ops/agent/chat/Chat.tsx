@@ -164,8 +164,11 @@ export function Chat({ name }: { name: string }) {
 }
 
 function describe(p: Proposal): string {
-  if (p.kind === "claim") return "assign this item to you";
-  if (p.kind === "set_status") return `set status to ${p.value}`;
-  if (p.kind === "set_priority") return `set priority to ${p.value}`;
-  return "update this item";
+  const n = p.items?.length ?? 0;
+  const noun = `${n} item${n === 1 ? "" : "s"}`;
+  if (p.kind === "claim") return `assign ${noun} to you`;
+  if (p.kind === "assign") return `assign ${noun} to the chosen teammate`;
+  if (p.kind === "set_status") return `set ${noun} to ${p.value}`;
+  if (p.kind === "set_priority") return `set ${noun} to ${p.value} priority`;
+  return `update ${noun}`;
 }
