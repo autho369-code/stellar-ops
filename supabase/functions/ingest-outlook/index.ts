@@ -129,6 +129,22 @@ function matchAssociationByAddress(text: string, idx: { id: string; num: number;
   return null;
 }
 
+// Ooma voicemail email parsing (sender no_reply@ooma.com).
+function parseOoma(body: string): { number: string | null; name: string | null; preview: string | null } {
+  const number = body.match(/Caller Number\s*([()\d\s\-+.]{7,})/i)?.[1]?.trim() ?? null;
+  const name = body.match(/Caller Name\s*([^\r\n]+)/i)?.[1]?.trim() ?? null;
+  const preview = body.split(/Voicemail Preview:/i)[1]?.trim() ?? null;
+  return { number, name, preview };
+}
+// Last 7 digits formatted "ddd-dddd" for an ilike match against stored phones.
+function phoneFragment(num: string | null): string | null {
+  if (!num) return null;
+  const d = num.replace(/\D/g, "");
+  if (d.length < 7) return null;
+  const l = d.slice(-7);
+  return l.slice(0, 3) + "-" + l.slice(3);
+}
+
 async function getGraphToken(tenant: string, clientId: string, secret: string) {
   const res = await fetch(`https://login.microsoftonline.com/${tenant}/oauth2/v2.0/token`, {
     method: "POST", headers: { "Content-Type": "application/x-www-form-urlencoded" },
@@ -216,6 +232,9 @@ Deno.serve(async (req: Request) => {
     if (a.address) for (const p of addressPairs(a.address)) addrIndex.push({ id: a.id, num: p.num, street: p.street });
   }
 
+  const { data: vEmails } = await supabase.from("vendors").select("name,email").eq("company_id", companyId).not("email", "is", null);
+  const vendorByEmail = new Map<string, string>((vEmails ?? []).map((v: any) => [String(v.email).toLowerCase(), v.name]));
+
   const { data: settings } = await supabase.from("agent_settings").select("triage_rules").eq("company_id", companyId).maybeSingle();
   const rules = (settings as any)?.triage_rules || DEFAULT_RULES;
 
@@ -228,7 +247,7 @@ Deno.serve(async (req: Request) => {
     return new Response(JSON.stringify({ error: String(e) }), { status: 502 });
   }
 
-  let created = 0, drafted = 0, skipped = 0, noise = 0, filed = 0;
+  let created = 0, drafted = 0, skipped = 0, noise = 0, filed = 0, calls = 0;
 
   for (const mailbox of mailboxes) {
     const url = `${GRAPH}/users/${encodeURIComponent(mailbox)}/mailFolders/inbox/messages?$filter=isRead eq false&$top=${maxPer}&$orderby=receivedDateTime desc&$select=id,subject,bodyPreview,from,receivedDateTime,webLink,hasAttachments`;
@@ -242,6 +261,38 @@ Deno.serve(async (req: Request) => {
 
       const fromAddr = msg.from?.emailAddress?.address ?? null;
 
+      // --- Ooma voicemail -> 'call' work item, recognized by caller phone ---
+      if ((fromAddr ?? "").toLowerCase().includes("ooma")) {
+        const oo = parseOoma(msg.bodyPreview ?? "");
+        if (!oo.number) {
+          // Ooma account/admin notification (not a voicemail) - skip as noise.
+          await supabase.from("processed_emails").insert({ company_id: companyId, graph_message_id: msg.id, mailbox, subject: msg.subject, from_address: fromAddr, work_item_id: null, draft_created: false });
+          noise++;
+          continue;
+        }
+        const frag = phoneFragment(oo.number);
+        let aId: string | null = null, uId: string | null = null, vendorName: string | null = null;
+        if (frag) {
+          const { data: oList } = await supabase.from("owners").select("unit_id, units:unit_id(association_id)").eq("company_id", companyId).ilike("phone", `%${frag}%`).limit(1);
+          const o = oList?.[0] as any;
+          if (o) { uId = o.unit_id ?? null; aId = o.units?.association_id ?? null; }
+          if (!aId) {
+            const { data: vList } = await supabase.from("vendors").select("name").eq("company_id", companyId).ilike("phone", `%${frag}%`).limit(1);
+            if (vList?.[0]) vendorName = (vList[0] as any).name;
+          }
+        }
+        const vt = await triageEmail(provider, { ...msg, bodyPreview: oo.preview ?? msg.bodyPreview }, false, rules);
+        const { data: wi } = await supabase.from("work_items").insert({
+          company_id: companyId, association_id: aId, unit_id: uId,
+          type: "call", title: oo.name ? `Voicemail: ${oo.name}` : (msg.subject || "Voicemail"),
+          description: msg.bodyPreview ?? null, source_channel: "ooma", priority: vt.priority,
+          metadata: { graph_message_id: msg.id, mailbox, caller_number: oo.number, caller_name: oo.name, vendor: vendorName, transcript: oo.preview },
+        }).select("id").single();
+        await supabase.from("processed_emails").insert({ company_id: companyId, graph_message_id: msg.id, mailbox, subject: msg.subject, from_address: fromAddr, work_item_id: wi?.id ?? null, draft_created: false });
+        calls++;
+        continue;
+      }
+
       let associationId: string | null = null;
       let unitId: string | null = null;
       if (fromAddr) {
@@ -250,10 +301,11 @@ Deno.serve(async (req: Request) => {
       }
       if (!associationId) associationId = matchAssociationByText(`${msg.subject ?? ""} ${msg.bodyPreview ?? ""}`, assocs);
       if (!associationId) associationId = matchAssociationByAddress(`${msg.subject ?? ""} ${msg.bodyPreview ?? ""}`, addrIndex);
+      const vendorName = fromAddr ? (vendorByEmail.get(fromAddr.toLowerCase()) ?? null) : null;
 
       const triage = await triageEmail(provider, msg, draftsEnabled, rules);
 
-      if (triage.isNoise) {
+      if (triage.isNoise && !vendorName) {
         await supabase.from("processed_emails").insert({ company_id: companyId, graph_message_id: msg.id, mailbox, subject: msg.subject, from_address: fromAddr, work_item_id: null, draft_created: false });
         noise++;
         continue;
@@ -269,7 +321,7 @@ Deno.serve(async (req: Request) => {
         company_id: companyId, association_id: associationId, unit_id: unitId,
         type: "email_doc", title: msg.subject || "(no subject)", description: msg.bodyPreview ?? null,
         source_channel: "outlook", priority: triage.priority,
-        metadata: { graph_message_id: msg.id, mailbox, from: fromAddr, web_link: msg.webLink, draft_created: draftCreated, debug: triage.raw },
+        metadata: { graph_message_id: msg.id, mailbox, from: fromAddr, web_link: msg.webLink, draft_created: draftCreated, vendor: vendorName, debug: triage.raw },
       }).select("id").single();
 
       // File document attachments into the association's Dropbox folder.
@@ -308,5 +360,5 @@ Deno.serve(async (req: Request) => {
     }
   }
 
-  return new Response(JSON.stringify({ configured: true, provider: provider ?? "none", drafts_enabled: draftsEnabled, dropbox: Boolean(dbxToken), mailboxes: mailboxes.length, created, noise, drafted, filed, skipped, at: new Date().toISOString() }), { headers: { "Content-Type": "application/json" } });
+  return new Response(JSON.stringify({ configured: true, provider: provider ?? "none", drafts_enabled: draftsEnabled, dropbox: Boolean(dbxToken), mailboxes: mailboxes.length, created, calls, noise, drafted, filed, skipped, at: new Date().toISOString() }), { headers: { "Content-Type": "application/json" } });
 });
