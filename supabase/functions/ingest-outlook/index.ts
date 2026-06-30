@@ -1,10 +1,9 @@
-// ingest-outlook — scheduled email agent.
-// Polls unread mail across the configured Outlook mailboxes via Microsoft Graph
-// (app-only), turns each new operational email into an email_doc work_item,
-// recognizes the association (by owner email, else by association name in the
-// subject/body), classifies urgency by Stellar's rules, and skips noise
-// (newsletters / automated notifications). Drafts replies ONLY when
-// ENABLE_DRAFTS=true (default off — triage only).
+// ingest-outlook - scheduled email agent.
+// For each new operational email: create an email_doc work_item, recognize the
+// association (owner email, else association name in subject/body), classify
+// urgency (rules from agent_settings), skip noise. If Dropbox is configured and
+// the email has document attachments, file them into that association's Dropbox
+// folder and log them in `documents`. Drafts only when ENABLE_DRAFTS=true.
 import "jsr:@supabase/functions-js/edge-runtime.d.ts";
 import { createClient } from "jsr:@supabase/supabase-js@2";
 
@@ -13,27 +12,22 @@ const DEFAULT_COMPANY = "d31ba98f-d0b3-4513-9246-8b0575edbc83";
 const DEFAULT_ANTHROPIC_MODEL = "claude-sonnet-4-6";
 const DEFAULT_OPENAI_MODEL = "gpt-4o-mini";
 const DEFAULT_OPENAI_BASE = "https://api.openai.com/v1";
+const DOC_EXT = ["pdf","doc","docx","xls","xlsx","csv","ppt","pptx","jpg","jpeg","png","gif","heic","bmp","tif","tiff"];
+const IMG_EXT = ["jpg","jpeg","png","gif","bmp","tif","tiff","heic"];
 
 type GraphMessage = {
   id: string;
   subject: string | null;
   bodyPreview: string | null;
   webLink: string | null;
+  hasAttachments?: boolean;
   from?: { emailAddress?: { address?: string; name?: string } };
 };
 
 type Triage = { priority: "emergency" | "urgent" | "routine"; isNoise: boolean; draft: string | null; raw: string };
 
-// Fallback triage rules — the live rules are read from public.agent_settings so
-// they can be tuned without redeploying the function.
 const DEFAULT_RULES =
-  "PRIORITY rules: " +
-  "emergency = immediate safety or major damage — active flooding, burst pipe, gushing/active water, " +
-  "no heat, gas smell/leak, fire/smoke/alarm, break-in or security breach, elevator entrapment. " +
-  "urgent = water/roof leaks or water intrusion (including recurring leaks), and other operational issues needing action soon. " +
-  "routine = everything else. " +
-  "Set is_noise=true ONLY for marketing, newsletters, promotional, or automated no-action notifications; " +
-  "false for any real operational/business email.";
+  "PRIORITY rules: emergency = immediate safety or major damage. urgent = water/roof leaks. routine = everything else. Set is_noise=true for marketing/newsletters/promotional/automated notifications.";
 
 function systemPrompt(rules: string, wantDraft: boolean): string {
   const base = "You triage email for Stellar Property Group, an HOA/condo manager. " + rules + " ";
@@ -64,12 +58,9 @@ async function anthropicComplete(system: string, msg: GraphMessage): Promise<str
   const res = await fetch("https://api.anthropic.com/v1/messages", {
     method: "POST",
     headers: { "x-api-key": Deno.env.get("ANTHROPIC_API_KEY")!, "anthropic-version": "2023-06-01", "content-type": "application/json" },
-    body: JSON.stringify({
-      model: Deno.env.get("ANTHROPIC_MODEL") ?? DEFAULT_ANTHROPIC_MODEL,
-      max_tokens: 1024, system, messages: [{ role: "user", content: userPrompt(msg) }],
-    }),
+    body: JSON.stringify({ model: Deno.env.get("ANTHROPIC_MODEL") ?? DEFAULT_ANTHROPIC_MODEL, max_tokens: 1024, system, messages: [{ role: "user", content: userPrompt(msg) }] }),
   });
-  if (!res.ok) throw new Error(`Anthropic ${res.status}`);
+  if (!res.ok) throw new Error(`Anthropic ${res.status}: ${(await res.text()).slice(0, 160)}`);
   return (await res.json()).content?.[0]?.text ?? "";
 }
 
@@ -78,12 +69,9 @@ async function openaiComplete(system: string, msg: GraphMessage): Promise<string
   const res = await fetch(`${base}/chat/completions`, {
     method: "POST",
     headers: { Authorization: `Bearer ${Deno.env.get("OPENAI_API_KEY")!}`, "Content-Type": "application/json" },
-    body: JSON.stringify({
-      model: Deno.env.get("OPENAI_MODEL") ?? DEFAULT_OPENAI_MODEL, max_tokens: 1024, temperature: 0.2,
-      messages: [{ role: "system", content: system }, { role: "user", content: userPrompt(msg) }],
-    }),
+    body: JSON.stringify({ model: Deno.env.get("OPENAI_MODEL") ?? DEFAULT_OPENAI_MODEL, max_tokens: 1024, temperature: 0.2, messages: [{ role: "system", content: system }, { role: "user", content: userPrompt(msg) }] }),
   });
-  if (!res.ok) throw new Error(`OpenAI-compatible ${res.status}`);
+  if (!res.ok) throw new Error(`OpenAI ${res.status}: ${(await res.text()).slice(0, 160)}`);
   return (await res.json()).choices?.[0]?.message?.content ?? "";
 }
 
@@ -100,36 +88,24 @@ async function triageEmail(provider: "anthropic" | "openai" | null, msg: GraphMe
   }
 }
 
-// Distinctive core of an association name (drop the generic suffixes) for
-// matching against email subject/body.
 function assocCore(name: string): string {
-  return name
-    .toLowerCase()
+  return name.toLowerCase()
     .replace(/\b(condominium association|condo association|condominiums?|homeowners? association|hoa|association|inc\.?)\b/g, " ")
-    .replace(/[^a-z0-9 ]/g, " ")
-    .replace(/\s+/g, " ")
-    .trim();
+    .replace(/[^a-z0-9 ]/g, " ").replace(/\s+/g, " ").trim();
 }
 
 function matchAssociationByText(text: string, assocs: { id: string; nameLower: string; core: string }[]): string | null {
   const t = text.toLowerCase();
-  let bestId: string | null = null;
-  let bestLen = 0;
-  for (const a of assocs) {
-    for (const cand of [a.nameLower, a.core]) {
-      if (cand && cand.length >= 5 && t.includes(cand) && cand.length > bestLen) {
-        bestId = a.id;
-        bestLen = cand.length;
-      }
-    }
+  let bestId: string | null = null, bestLen = 0;
+  for (const a of assocs) for (const cand of [a.nameLower, a.core]) {
+    if (cand && cand.length >= 5 && t.includes(cand) && cand.length > bestLen) { bestId = a.id; bestLen = cand.length; }
   }
   return bestId;
 }
 
 async function getGraphToken(tenant: string, clientId: string, secret: string) {
   const res = await fetch(`https://login.microsoftonline.com/${tenant}/oauth2/v2.0/token`, {
-    method: "POST",
-    headers: { "Content-Type": "application/x-www-form-urlencoded" },
+    method: "POST", headers: { "Content-Type": "application/x-www-form-urlencoded" },
     body: new URLSearchParams({ client_id: clientId, client_secret: secret, scope: "https://graph.microsoft.com/.default", grant_type: "client_credentials" }),
   });
   if (!res.ok) throw new Error(`Graph token failed: ${res.status} ${await res.text()}`);
@@ -146,9 +122,42 @@ async function createDraftReply(token: string, mailbox: string, messageId: strin
       body: JSON.stringify({ body: { contentType: "Text", content: body } }),
     });
     return p.ok;
-  } catch (_) {
-    return false;
-  }
+  } catch (_) { return false; }
+}
+
+// --- Dropbox ----------------------------------------------------------------
+async function dropboxToken(): Promise<string | null> {
+  const key = Deno.env.get("DROPBOX_APP_KEY"), sec = Deno.env.get("DROPBOX_APP_SECRET"), rt = Deno.env.get("DROPBOX_REFRESH_TOKEN");
+  if (!key || !sec || !rt) return null;
+  const res = await fetch("https://api.dropboxapi.com/oauth2/token", {
+    method: "POST", headers: { "Content-Type": "application/x-www-form-urlencoded" },
+    body: new URLSearchParams({ grant_type: "refresh_token", refresh_token: rt, client_id: key, client_secret: sec }),
+  });
+  if (!res.ok) return null;
+  return (await res.json()).access_token ?? null;
+}
+
+function dbxArg(obj: unknown): string {
+  // Dropbox-API-Arg must be ASCII; escape non-ASCII chars.
+  return JSON.stringify(obj).split("").map((ch) => ch.charCodeAt(0) > 127 ? "\\u" + ch.charCodeAt(0).toString(16).padStart(4, "0") : ch).join("");
+}
+
+async function dropboxUpload(token: string, path: string, bytes: Uint8Array): Promise<string | null> {
+  const res = await fetch("https://content.dropboxapi.com/2/files/upload", {
+    method: "POST",
+    headers: { Authorization: `Bearer ${token}`, "Dropbox-API-Arg": dbxArg({ path, mode: "add", autorename: true, mute: true }), "Content-Type": "application/octet-stream" },
+    body: bytes,
+  });
+  if (!res.ok) return null;
+  return (await res.json()).path_display ?? path;
+}
+
+function isDocAttachment(att: any): boolean {
+  if (att["@odata.type"] !== "#microsoft.graph.fileAttachment" || att.isInline) return false;
+  const ext = (att.name || "").toLowerCase().split(".").pop() ?? "";
+  if (!DOC_EXT.includes(ext)) return false;
+  if (IMG_EXT.includes(ext) && (att.size || 0) < 20000) return false; // skip signature/logo images
+  return true;
 }
 
 Deno.serve(async (req: Request) => {
@@ -173,12 +182,14 @@ Deno.serve(async (req: Request) => {
 
   const supabase = createClient(Deno.env.get("SUPABASE_URL")!, Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")!);
 
-  // Association name index (for tagging vendor/lawyer mail that names the association).
-  const { data: assocData } = await supabase.from("associations").select("id,name").eq("company_id", companyId);
+  const { data: assocData } = await supabase.from("associations").select("id,name,dropbox_folder_path").eq("company_id", companyId);
   const assocs = (assocData ?? []).map((a: any) => ({ id: a.id, nameLower: a.name.toLowerCase(), core: assocCore(a.name) }));
+  const folderById = new Map<string, string>((assocData ?? []).filter((a: any) => a.dropbox_folder_path).map((a: any) => [a.id, a.dropbox_folder_path]));
 
   const { data: settings } = await supabase.from("agent_settings").select("triage_rules").eq("company_id", companyId).maybeSingle();
   const rules = (settings as any)?.triage_rules || DEFAULT_RULES;
+
+  const dbxToken = await dropboxToken();
 
   let token: string;
   try {
@@ -187,10 +198,10 @@ Deno.serve(async (req: Request) => {
     return new Response(JSON.stringify({ error: String(e) }), { status: 502 });
   }
 
-  let created = 0, drafted = 0, skipped = 0, noise = 0;
+  let created = 0, drafted = 0, skipped = 0, noise = 0, filed = 0;
 
   for (const mailbox of mailboxes) {
-    const url = `${GRAPH}/users/${encodeURIComponent(mailbox)}/mailFolders/inbox/messages?$filter=isRead eq false&$top=${maxPer}&$orderby=receivedDateTime desc&$select=id,subject,bodyPreview,from,receivedDateTime,webLink`;
+    const url = `${GRAPH}/users/${encodeURIComponent(mailbox)}/mailFolders/inbox/messages?$filter=isRead eq false&$top=${maxPer}&$orderby=receivedDateTime desc&$select=id,subject,bodyPreview,from,receivedDateTime,webLink,hasAttachments`;
     const res = await fetch(url, { headers: { Authorization: `Bearer ${token}` } });
     if (!res.ok) continue;
     const messages: GraphMessage[] = (await res.json()).value ?? [];
@@ -201,7 +212,6 @@ Deno.serve(async (req: Request) => {
 
       const fromAddr = msg.from?.emailAddress?.address ?? null;
 
-      // Recognition: owner email first, else association name in subject/body.
       let associationId: string | null = null;
       let unitId: string | null = null;
       if (fromAddr) {
@@ -212,7 +222,6 @@ Deno.serve(async (req: Request) => {
 
       const triage = await triageEmail(provider, msg, draftsEnabled, rules);
 
-      // Skip noise: record it so we don't re-evaluate, but create no work item.
       if (triage.isNoise) {
         await supabase.from("processed_emails").insert({ company_id: companyId, graph_message_id: msg.id, mailbox, subject: msg.subject, from_address: fromAddr, work_item_id: null, draft_created: false });
         noise++;
@@ -232,10 +241,41 @@ Deno.serve(async (req: Request) => {
         metadata: { graph_message_id: msg.id, mailbox, from: fromAddr, web_link: msg.webLink, draft_created: draftCreated, debug: triage.raw },
       }).select("id").single();
 
+      // File document attachments into the association's Dropbox folder.
+      if (msg.hasAttachments && dbxToken && associationId && folderById.get(associationId)) {
+        const folder = folderById.get(associationId)!;
+        try {
+          const ar = await fetch(`${GRAPH}/users/${encodeURIComponent(mailbox)}/messages/${msg.id}/attachments`, { headers: { Authorization: `Bearer ${token}` } });
+          if (ar.ok) {
+            const atts = (await ar.json()).value ?? [];
+            for (const att of atts) {
+              if (!isDocAttachment(att)) continue;
+              let bytes: Uint8Array | null = null;
+              if (att.contentBytes) {
+                const bin = atob(att.contentBytes);
+                bytes = Uint8Array.from(bin, (c) => c.charCodeAt(0));
+              } else {
+                const v = await fetch(`${GRAPH}/users/${encodeURIComponent(mailbox)}/messages/${msg.id}/attachments/${att.id}/$value`, { headers: { Authorization: `Bearer ${token}` } });
+                if (v.ok) bytes = new Uint8Array(await v.arrayBuffer());
+              }
+              if (!bytes) continue;
+              const stored = await dropboxUpload(dbxToken, `${folder}/Email Attachments/${att.name}`, bytes);
+              if (stored) {
+                await supabase.from("documents").insert({
+                  company_id: companyId, association_id: associationId, work_item_id: workItem?.id ?? null,
+                  filename: att.name, doc_type: (att.name.split(".").pop() || "").toLowerCase(), storage_path: stored, classified_by: "agent", status: "filed",
+                });
+                filed++;
+              }
+            }
+          }
+        } catch (_) { /* don't let attachment filing break ingestion */ }
+      }
+
       await supabase.from("processed_emails").insert({ company_id: companyId, graph_message_id: msg.id, mailbox, subject: msg.subject, from_address: fromAddr, work_item_id: workItem?.id ?? null, draft_created: draftCreated });
       created++;
     }
   }
 
-  return new Response(JSON.stringify({ configured: true, provider: provider ?? "none", drafts_enabled: draftsEnabled, mailboxes: mailboxes.length, created, noise, drafted, skipped, at: new Date().toISOString() }), { headers: { "Content-Type": "application/json" } });
+  return new Response(JSON.stringify({ configured: true, provider: provider ?? "none", drafts_enabled: draftsEnabled, dropbox: Boolean(dbxToken), mailboxes: mailboxes.length, created, noise, drafted, filed, skipped, at: new Date().toISOString() }), { headers: { "Content-Type": "application/json" } });
 });
