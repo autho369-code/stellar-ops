@@ -45,10 +45,11 @@ async function callOpenai(system: string, msgs: Msg[]): Promise<string> {
 // A compact, live snapshot of the queues so Arthur can answer real questions.
 async function buildContext(supabase: any, companyId: string): Promise<string> {
   const nowIso = new Date().toISOString();
-  const [assoc, team, knowledge, recent, openC, overdueC, emergC, draftC] = await Promise.all([
+  const [assoc, team, knowledge, obligations, recent, openC, overdueC, emergC, draftC] = await Promise.all([
     supabase.from("associations").select("id,name").eq("company_id", companyId),
     supabase.from("team_members").select("id,name").eq("company_id", companyId).eq("active", true).order("name"),
     supabase.from("knowledge_notes").select("scope,ref_name,body").eq("company_id", companyId),
+    supabase.from("recurring_obligations").select("title,category,next_due_date,interval_months,association_id").eq("company_id", companyId).eq("active", true).order("next_due_date", { ascending: true, nullsFirst: false }),
     supabase.from("work_items").select("id,title,type,priority,status,source_channel,association_id,assigned_to,due_date,created_at,metadata").eq("company_id", companyId).order("created_at", { ascending: false }).limit(30),
     supabase.from("work_items").select("*", { count: "exact", head: true }).eq("company_id", companyId).is("owner_user_id", null).eq("status", "open"),
     supabase.from("work_items").select("*", { count: "exact", head: true }).eq("company_id", companyId).lt("due_date", nowIso).neq("status", "done"),
@@ -73,14 +74,26 @@ async function buildContext(supabase: any, companyId: string): Promise<string> {
   if (kn.length) {
     learned = "\n\nBUSINESS KNOWLEDGE (learned from email + Dropbox history; factual snapshot):\n" +
       general.join("\n") + (general.length ? "\n" : "") + assocNotes.join("\n");
-    if (learned.length > 9000) learned = learned.slice(0, 9000) + " ...(truncated)";
+    if (learned.length > 24000) learned = learned.slice(0, 24000) + " ...(truncated)";
   }
+
+  // Recurring obligations (renewals & inspections) — the source of truth for
+  // "when is X due". Empty until the team enters them.
+  const obs = (obligations.data ?? []) as any[];
+  const obLines = obs.map((o) => {
+    const who = o.association_id ? names.get(o.association_id) ?? "?" : "(all/general)";
+    return `- ${who}: ${o.title}${o.category ? ` [${o.category}]` : ""} — next due ${o.next_due_date ?? "unset"}${o.interval_months ? `, every ${o.interval_months} months` : ""}`;
+  }).join("\n");
+  const obligationsBlock =
+    "\n\nRECURRING OBLIGATIONS (renewals & inspections being tracked — this is the ONLY source for due dates):\n" +
+    (obLines || "(none entered yet — no renewal or inspection dates are being tracked. If asked when something is due, say it isn't tracked yet and should be added on the Recurring page.)");
 
   return (
     "OPERATIONS CONTEXT (live snapshot):\n" +
     `Unclaimed open items: ${openC.count ?? 0} | Overdue: ${overdueC.count ?? 0} | Open emergencies: ${emergC.count ?? 0} | Drafts waiting in Outlook: ${draftC.count ?? 0}\n` +
     "TEAM (assignable):\n" + (roster || "(none)") + "\n\n" +
     "Recent items (newest first):\n" + (lines || "(nothing yet)") +
+    obligationsBlock +
     learned
   );
 }
