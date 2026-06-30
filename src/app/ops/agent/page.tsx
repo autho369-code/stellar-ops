@@ -158,6 +158,15 @@ export default async function AgentPage() {
       </div>
 
       {admin && (
+        <div className="mb-6">
+          <Link href="/ops/agent/signatures" className="text-sm font-medium text-blue-600 hover:underline">
+            Manage email signatures →
+          </Link>
+          <span className="ml-2 text-xs text-neutral-400">Added to draft replies per sender.</span>
+        </div>
+      )}
+
+      {admin && (
       <form action={saveAgentSettings} className="space-y-8">
         {/* Identity */}
         <section className="space-y-3">

@@ -189,14 +189,24 @@ async function getGraphToken(tenant: string, clientId: string, secret: string) {
   return (await res.json()).access_token as string;
 }
 
-async function createDraftReply(token: string, mailbox: string, messageId: string, body: string): Promise<boolean> {
+// Graph-created drafts don't get Outlook's auto-signature, so we append the
+// sender's stored signature ourselves. Body sent as HTML so it renders.
+function plainToHtml(s: string): string {
+  return s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/\r\n|\n/g, "<br>");
+}
+function asHtml(s: string): string {
+  return /<[a-z][\s\S]*>/i.test(s) ? s : plainToHtml(s); // already HTML? use as-is
+}
+
+async function createDraftReply(token: string, mailbox: string, messageId: string, body: string, signature: string | null): Promise<boolean> {
   try {
     const r = await fetch(`${GRAPH}/users/${encodeURIComponent(mailbox)}/messages/${messageId}/createReply`, { method: "POST", headers: { Authorization: `Bearer ${token}` } });
     if (!r.ok) return false;
     const draft = await r.json();
+    const html = plainToHtml(body) + (signature ? "<br><br>" + asHtml(signature) : "");
     const p = await fetch(`${GRAPH}/users/${encodeURIComponent(mailbox)}/messages/${draft.id}`, {
       method: "PATCH", headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json" },
-      body: JSON.stringify({ body: { contentType: "Text", content: body } }),
+      body: JSON.stringify({ body: { contentType: "HTML", content: html } }),
     });
     return p.ok;
   } catch (_) { return false; }
@@ -325,6 +335,10 @@ Deno.serve(async (req: Request) => {
   const { data: vEmails } = await supabase.from("vendors").select("name,email").eq("company_id", companyId).not("email", "is", null);
   const vendorByEmail = new Map<string, string>((vEmails ?? []).map((v: any) => [String(v.email).toLowerCase(), v.name]));
 
+  // Each staff member's saved signature, keyed by their mailbox address.
+  const { data: tmSig } = await supabase.from("team_members").select("email,signature").eq("company_id", companyId);
+  const signatureByMailbox = new Map<string, string>((tmSig ?? []).filter((t: any) => t.signature).map((t: any) => [String(t.email).toLowerCase(), t.signature]));
+
   const { data: settings } = await supabase.from("agent_settings").select("triage_rules,draft_guidance,agent_name,persona,schedule_tz,active_start_hour,active_end_hour,active_interval_min,quiet_interval_min,active_days,last_run_at").eq("company_id", companyId).maybeSingle();
   const s = (settings as any) ?? {};
   const rules = s.triage_rules || DEFAULT_RULES;
@@ -415,7 +429,7 @@ Deno.serve(async (req: Request) => {
 
       let draftCreated = false;
       if (draftsEnabled && triage.draft) {
-        draftCreated = await createDraftReply(token, mailbox, msg.id, triage.draft);
+        draftCreated = await createDraftReply(token, mailbox, msg.id, triage.draft, signatureByMailbox.get(mailbox.toLowerCase()) ?? null);
         if (draftCreated) drafted++;
       }
 
