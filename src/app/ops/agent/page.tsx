@@ -41,7 +41,7 @@ export default async function AgentPage() {
 
   const admin = await isAdmin(supabase, user.id);
 
-  const [{ data: settings }, emails, calls, docs, recognized, totalItems, knowledge] =
+  const [{ data: settings }, emails, calls, docs, recognized, totalItems, knowledge, modes] =
     await Promise.all([
       supabase.from("agent_settings").select("*").maybeSingle(),
       supabase.from("work_items").select("*", { count: "exact", head: true }).eq("source_channel", "outlook"),
@@ -50,6 +50,7 @@ export default async function AgentPage() {
       supabase.from("work_items").select("*", { count: "exact", head: true }).in("source_channel", ["outlook", "ooma"]).not("association_id", "is", null),
       supabase.from("work_items").select("*", { count: "exact", head: true }).in("source_channel", ["outlook", "ooma"]),
       supabase.from("knowledge_notes").select("*", { count: "exact", head: true }),
+      supabase.from("team_members").select("agent_mode"),
     ]);
 
   const s = (settings as any) ?? {};
@@ -63,6 +64,19 @@ export default async function AgentPage() {
   const tzLabel = TZS.find(([v]) => v === tz)?.[1] ?? tz;
 
   const pct = totalItems.count ? Math.round((100 * (recognized.count ?? 0)) / totalItems.count) : 0;
+
+  const modeCounts = ((modes.data as { agent_mode: string }[]) ?? []).reduce(
+    (acc, m) => acc.set(m.agent_mode, (acc.get(m.agent_mode) ?? 0) + 1),
+    new Map<string, number>(),
+  );
+  const totalMailboxes = modes.data?.length ?? 0;
+  const fullCount = modeCounts.get("full") ?? 0;
+  const draftsLabel =
+    fullCount === 0
+      ? "Drafts · off (filing only)"
+      : fullCount === totalMailboxes
+        ? "Drafts · review-only"
+        : `Drafts · review-only (${fullCount}/${totalMailboxes} mailboxes)`;
 
   const stat = (label: string, value: number | string) => (
     <div className="rounded-xl border border-neutral-200 bg-white p-4">
@@ -105,7 +119,7 @@ export default async function AgentPage() {
           "Email · 5 mailboxes",
           "Phone · Ooma",
           "Documents · Dropbox",
-          "Drafts · review-only",
+          draftsLabel,
         ].map((t) => (
           <span key={t} className="rounded-full bg-green-100 px-2.5 py-1 font-medium text-green-700">{t}</span>
         ))}
