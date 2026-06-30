@@ -302,6 +302,47 @@ async function classifyToSubfolder(provider: "anthropic" | "openai" | null, subj
   }
 }
 
+// File an email's document attachments into the association's Dropbox folder
+// (classified into the right subfolder). Used by both full and file-only modes.
+async function fileEmailAttachments(
+  supabase: any, token: string, dbxToken: string, provider: "anthropic" | "openai" | null,
+  mailbox: string, msg: GraphMessage, companyId: string, associationId: string, folder: string, workItemId: string | null,
+): Promise<number> {
+  let n = 0;
+  try {
+    const subfolders = await dropboxSubfolders(dbxToken, folder);
+    const ar = await fetch(`${GRAPH}/users/${encodeURIComponent(mailbox)}/messages/${msg.id}/attachments`, { headers: { Authorization: `Bearer ${token}` } });
+    if (!ar.ok) return 0;
+    const atts = (await ar.json()).value ?? [];
+    for (const att of atts) {
+      if (!isDocAttachment(att)) continue;
+      const { data: dup } = await supabase.from("documents").select("id").eq("company_id", companyId).eq("association_id", associationId).ilike("filename", att.name).maybeSingle();
+      if (dup) continue;
+      let bytes: Uint8Array | null = null;
+      if (att.contentBytes) {
+        const bin = atob(att.contentBytes);
+        bytes = Uint8Array.from(bin, (c) => c.charCodeAt(0));
+      } else {
+        const v = await fetch(`${GRAPH}/users/${encodeURIComponent(mailbox)}/messages/${msg.id}/attachments/${att.id}/$value`, { headers: { Authorization: `Bearer ${token}` } });
+        if (v.ok) bytes = new Uint8Array(await v.arrayBuffer());
+      }
+      if (!bytes) continue;
+      const sub = await classifyToSubfolder(provider, msg.subject ?? "", att.name, subfolders);
+      const targetDir = sub ? `${folder}/${sub}` : `${folder}/Email Attachments`;
+      const stored = await dropboxUpload(dbxToken, `${targetDir}/${att.name}`, bytes);
+      if (stored) {
+        await supabase.from("documents").insert({
+          company_id: companyId, association_id: associationId, work_item_id: workItemId,
+          filename: att.name, doc_type: (att.name.split(".").pop() || "").toLowerCase(), storage_path: stored, classified_by: "agent",
+          status: sub ? "filed" : "needs_review",
+        });
+        n++;
+      }
+    }
+  } catch (_) { /* don't let attachment filing break ingestion */ }
+  return n;
+}
+
 Deno.serve(async (req: Request) => {
   const secret = Deno.env.get("CRON_SECRET");
   if (secret) {
@@ -335,9 +376,12 @@ Deno.serve(async (req: Request) => {
   const { data: vEmails } = await supabase.from("vendors").select("name,email").eq("company_id", companyId).not("email", "is", null);
   const vendorByEmail = new Map<string, string>((vEmails ?? []).map((v: any) => [String(v.email).toLowerCase(), v.name]));
 
-  // Each staff member's saved signature, keyed by their mailbox address.
-  const { data: tmSig } = await supabase.from("team_members").select("email,signature").eq("company_id", companyId);
-  const signatureByMailbox = new Map<string, string>((tmSig ?? []).filter((t: any) => t.signature).map((t: any) => [String(t.email).toLowerCase(), t.signature]));
+  // Each staff member's signature + agent mode, keyed by their mailbox address.
+  // mode: "full" (triage + draft + queue + file) | "file_only" (only file
+  // attachments to Dropbox) | "off" (ignore the mailbox entirely).
+  const { data: tmRows } = await supabase.from("team_members").select("email,signature,agent_mode").eq("company_id", companyId);
+  const signatureByMailbox = new Map<string, string>((tmRows ?? []).filter((t: any) => t.signature).map((t: any) => [String(t.email).toLowerCase(), t.signature]));
+  const modeByMailbox = new Map<string, string>((tmRows ?? []).map((t: any) => [String(t.email).toLowerCase(), t.agent_mode || "full"]));
 
   const { data: settings } = await supabase.from("agent_settings").select("triage_rules,draft_guidance,agent_name,persona,schedule_tz,active_start_hour,active_end_hour,active_interval_min,quiet_interval_min,active_days,last_run_at").eq("company_id", companyId).maybeSingle();
   const s = (settings as any) ?? {};
@@ -376,9 +420,20 @@ Deno.serve(async (req: Request) => {
       if (seen) { skipped++; continue; }
 
       const fromAddr = msg.from?.emailAddress?.address ?? null;
+      const mode = modeByMailbox.get(mailbox.toLowerCase()) ?? "full";
+
+      if (mode === "off") {
+        await supabase.from("processed_emails").insert({ company_id: companyId, graph_message_id: msg.id, mailbox, subject: msg.subject, from_address: fromAddr, work_item_id: null, draft_created: false });
+        skipped++;
+        continue;
+      }
 
       // --- Ooma voicemail -> 'call' work item, recognized by caller phone ---
       if ((fromAddr ?? "").toLowerCase().includes("ooma")) {
+        if (mode !== "full") {
+          await supabase.from("processed_emails").insert({ company_id: companyId, graph_message_id: msg.id, mailbox, subject: msg.subject, from_address: fromAddr, work_item_id: null, draft_created: false });
+          continue;
+        }
         const oo = parseOoma(msg.bodyPreview ?? "");
         if (!oo.number) {
           // Ooma account/admin notification (not a voicemail) - skip as noise.
@@ -417,6 +472,17 @@ Deno.serve(async (req: Request) => {
       }
       if (!associationId) associationId = matchAssociationByText(`${msg.subject ?? ""} ${msg.bodyPreview ?? ""}`, assocs);
       if (!associationId) associationId = matchAssociationByAddress(`${msg.subject ?? ""} ${msg.bodyPreview ?? ""}`, addrIndex);
+
+      // FILE-ONLY mailbox: only save attachments to Dropbox. No triage, no draft,
+      // no queue item — the email is left untouched.
+      if (mode === "file_only") {
+        if (msg.hasAttachments && dbxToken && associationId && folderById.get(associationId)) {
+          filed += await fileEmailAttachments(supabase, token, dbxToken, provider, mailbox, msg, companyId, associationId, folderById.get(associationId)!, null);
+        }
+        await supabase.from("processed_emails").insert({ company_id: companyId, graph_message_id: msg.id, mailbox, subject: msg.subject, from_address: fromAddr, work_item_id: null, draft_created: false });
+        continue;
+      }
+
       const vendorName = fromAddr ? (vendorByEmail.get(fromAddr.toLowerCase()) ?? null) : null;
 
       const triage = await triageEmail(provider, msg, draftsEnabled, rules, guidance, agentName, persona);
@@ -442,41 +508,7 @@ Deno.serve(async (req: Request) => {
 
       // File document attachments into the RIGHT subfolder of the association.
       if (msg.hasAttachments && dbxToken && associationId && folderById.get(associationId)) {
-        const folder = folderById.get(associationId)!;
-        try {
-          const subfolders = await dropboxSubfolders(dbxToken, folder);
-          const ar = await fetch(`${GRAPH}/users/${encodeURIComponent(mailbox)}/messages/${msg.id}/attachments`, { headers: { Authorization: `Bearer ${token}` } });
-          if (ar.ok) {
-            const atts = (await ar.json()).value ?? [];
-            for (const att of atts) {
-              if (!isDocAttachment(att)) continue;
-              // Dedup: skip if this association already has a file by this name.
-              const { data: dup } = await supabase.from("documents").select("id").eq("company_id", companyId).eq("association_id", associationId).ilike("filename", att.name).maybeSingle();
-              if (dup) continue;
-              let bytes: Uint8Array | null = null;
-              if (att.contentBytes) {
-                const bin = atob(att.contentBytes);
-                bytes = Uint8Array.from(bin, (c) => c.charCodeAt(0));
-              } else {
-                const v = await fetch(`${GRAPH}/users/${encodeURIComponent(mailbox)}/messages/${msg.id}/attachments/${att.id}/$value`, { headers: { Authorization: `Bearer ${token}` } });
-                if (v.ok) bytes = new Uint8Array(await v.arrayBuffer());
-              }
-              if (!bytes) continue;
-              // Classify into one of the association's existing subfolders.
-              const sub = await classifyToSubfolder(provider, msg.subject ?? "", att.name, subfolders);
-              const targetDir = sub ? `${folder}/${sub}` : `${folder}/Email Attachments`;
-              const stored = await dropboxUpload(dbxToken, `${targetDir}/${att.name}`, bytes);
-              if (stored) {
-                await supabase.from("documents").insert({
-                  company_id: companyId, association_id: associationId, work_item_id: workItem?.id ?? null,
-                  filename: att.name, doc_type: (att.name.split(".").pop() || "").toLowerCase(), storage_path: stored, classified_by: "agent",
-                  status: sub ? "filed" : "needs_review", // unmatched -> flagged, not silently dumped
-                });
-                filed++;
-              }
-            }
-          }
-        } catch (_) { /* don't let attachment filing break ingestion */ }
+        filed += await fileEmailAttachments(supabase, token, dbxToken, provider, mailbox, msg, companyId, associationId, folderById.get(associationId)!, workItem?.id ?? null);
       }
 
       await supabase.from("processed_emails").insert({ company_id: companyId, graph_message_id: msg.id, mailbox, subject: msg.subject, from_address: fromAddr, work_item_id: workItem?.id ?? null, draft_created: draftCreated });
