@@ -47,7 +47,7 @@ async function buildContext(supabase: any, companyId: string): Promise<string> {
   const nowIso = new Date().toISOString();
   const [assoc, recent, openC, overdueC, emergC, draftC] = await Promise.all([
     supabase.from("associations").select("id,name").eq("company_id", companyId),
-    supabase.from("work_items").select("title,type,priority,status,source_channel,association_id,due_date,created_at,metadata").eq("company_id", companyId).order("created_at", { ascending: false }).limit(30),
+    supabase.from("work_items").select("id,title,type,priority,status,source_channel,association_id,due_date,created_at,metadata").eq("company_id", companyId).order("created_at", { ascending: false }).limit(30),
     supabase.from("work_items").select("*", { count: "exact", head: true }).eq("company_id", companyId).is("owner_user_id", null).eq("status", "open"),
     supabase.from("work_items").select("*", { count: "exact", head: true }).eq("company_id", companyId).lt("due_date", nowIso).neq("status", "done"),
     supabase.from("work_items").select("*", { count: "exact", head: true }).eq("company_id", companyId).eq("priority", "emergency").neq("status", "done"),
@@ -57,7 +57,7 @@ async function buildContext(supabase: any, companyId: string): Promise<string> {
   const lines = (recent.data ?? []).map((w: any) => {
     const who = w.association_id ? names.get(w.association_id) ?? "unrecognized" : "unrecognized";
     const drafted = w.metadata?.draft_created ? ", draft ready" : "";
-    return `- [${w.priority}/${w.status}] ${w.title} (${w.source_channel}, ${who}${drafted})`;
+    return `- id=${w.id} [${w.priority}/${w.status}] ${w.title} (${w.source_channel}, ${who}${drafted})`;
   }).join("\n");
   return (
     "OPERATIONS CONTEXT (live snapshot):\n" +
@@ -92,15 +92,35 @@ Deno.serve(async (req: Request) => {
   const system =
     `You are ${name}, the operations assistant for Stellar Property Group, an HOA/condo property manager. ${persona ? persona + " " : ""}` +
     "You are chatting with Stellar staff inside the internal operations hub. Use the live OPERATIONS CONTEXT below to answer questions about what has come in, what is urgent or overdue, to summarize voicemails and emails, and to draft replies when asked. " +
-    "Be concise, practical, and specific. When asked to do something you cannot do from chat (actually send an email, mark an item done, change a setting), explain exactly what you would do and tell them where in the hub to do it. " +
+    "Be concise, practical, and specific. " +
     "Never invent facts, dates, names, unit numbers, or commitments that are not supported by the context.\n\n" +
+    "ACTIONS: You may propose ONE action on a specific item from the context when the staff member clearly asks you to take/claim it, change its status, or change its priority. " +
+    "To propose, end your message with a single line exactly like:\n" +
+    '@@ACTION {"kind":"set_status","item":"<id from context>","value":"done","summary":"Mark <title> done"}@@\n' +
+    "Allowed: kind=set_status with value in [open,in_progress,escalated,done]; kind=set_priority with value in [emergency,urgent,routine]; kind=claim (no value, assigns the item to this staff member). " +
+    "Use the exact id= value shown in the context. Phrase your sentence as a proposal (e.g. 'Want me to mark it done?') because the staff member must confirm before it runs. Propose at most one action per reply. " +
+    "You CANNOT send or finalize emails — drafts are reviewed and sent by a person from Outlook; if asked to send, say so.\n\n" +
     context;
 
   const provider = selectedProvider();
   if (!provider) return json({ error: "No LLM provider configured." }, 500);
   try {
-    const reply = provider === "anthropic" ? await callAnthropic(system, messages) : await callOpenai(system, messages);
-    return json({ agent: name, reply });
+    let reply = provider === "anthropic" ? await callAnthropic(system, messages) : await callOpenai(system, messages);
+
+    // Pull out an optional @@ACTION {...}@@ proposal; the hub confirms + runs it.
+    let proposal: { kind: string; item: string; value: string | null; summary: string } | null = null;
+    const m = reply.match(/@@ACTION\s*(\{[\s\S]*?\})\s*@@/);
+    if (m) {
+      try {
+        const a = JSON.parse(m[1]);
+        if (a && typeof a.item === "string" && ["set_status", "set_priority", "claim"].includes(a.kind)) {
+          proposal = { kind: a.kind, item: a.item, value: typeof a.value === "string" ? a.value : null, summary: typeof a.summary === "string" ? a.summary : "" };
+        }
+      } catch (_) { /* ignore malformed proposals */ }
+      reply = reply.replace(m[0], "").trim();
+    }
+
+    return json({ agent: name, reply, proposal });
   } catch (e) {
     return json({ error: e instanceof Error ? e.message : String(e) }, 502);
   }
