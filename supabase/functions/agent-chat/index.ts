@@ -45,11 +45,12 @@ async function callOpenai(system: string, msgs: Msg[]): Promise<string> {
 // A compact, live snapshot of the queues so Arthur can answer real questions.
 async function buildContext(supabase: any, companyId: string): Promise<string> {
   const nowIso = new Date().toISOString();
-  const [assoc, team, knowledge, obligations, recent, openC, overdueC, emergC, draftC] = await Promise.all([
+  const [assoc, team, knowledge, obligations, filedDocs, recent, openC, overdueC, emergC, draftC] = await Promise.all([
     supabase.from("associations").select("id,name").eq("company_id", companyId),
     supabase.from("team_members").select("id,name").eq("company_id", companyId).eq("active", true).order("name"),
     supabase.from("knowledge_notes").select("scope,ref_name,body").eq("company_id", companyId),
     supabase.from("recurring_obligations").select("title,category,next_due_date,interval_months,association_id").eq("company_id", companyId).eq("active", true).order("next_due_date", { ascending: true, nullsFirst: false }),
+    supabase.from("documents").select("filename,storage_path,association_id,created_at").eq("company_id", companyId).order("created_at", { ascending: false }).limit(25),
     supabase.from("work_items").select("id,title,type,priority,status,source_channel,association_id,assigned_to,due_date,created_at,metadata").eq("company_id", companyId).order("created_at", { ascending: false }).limit(30),
     supabase.from("work_items").select("*", { count: "exact", head: true }).eq("company_id", companyId).is("owner_user_id", null).eq("status", "open"),
     supabase.from("work_items").select("*", { count: "exact", head: true }).eq("company_id", companyId).lt("due_date", nowIso).neq("status", "done"),
@@ -88,12 +89,23 @@ async function buildContext(supabase: any, companyId: string): Promise<string> {
     "\n\nRECURRING OBLIGATIONS (renewals & inspections being tracked — this is the ONLY source for due dates):\n" +
     (obLines || "(none entered yet — no renewal or inspection dates are being tracked. If asked when something is due, say it isn't tracked yet and should be added on the Recurring page.)");
 
+  // Documents the agent has filed into Dropbox (so Arthur can say what/where).
+  const docs = (filedDocs.data ?? []) as any[];
+  const docLines = docs.map((d) => {
+    const who = d.association_id ? names.get(d.association_id) ?? "?" : "(unrecognized)";
+    return `- ${who}: ${d.filename} -> ${d.storage_path ?? "?"}`;
+  }).join("\n");
+  const docsBlock =
+    "\n\nRECENTLY FILED DOCUMENTS (attachments you filed into Dropbox, newest first):\n" +
+    (docLines || "(none filed yet)");
+
   return (
     "OPERATIONS CONTEXT (live snapshot):\n" +
     `Unclaimed open items: ${openC.count ?? 0} | Overdue: ${overdueC.count ?? 0} | Open emergencies: ${emergC.count ?? 0} | Drafts waiting in Outlook: ${draftC.count ?? 0}\n` +
     "TEAM (assignable):\n" + (roster || "(none)") + "\n\n" +
     "Recent items (newest first):\n" + (lines || "(nothing yet)") +
     obligationsBlock +
+    docsBlock +
     learned
   );
 }
