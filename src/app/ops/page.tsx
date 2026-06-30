@@ -39,6 +39,14 @@ export default async function OpsDashboard({
   const { data: team } = await supabase.from("team_members").select("id, name");
   const teamNames = new Map((team ?? []).map((t) => [t.id, t.name]));
 
+  // Which roster entry is the signed-in person? Drives "My Queue".
+  const { data: me } = await supabase
+    .from("team_members")
+    .select("id")
+    .eq("auth_user_id", user.id)
+    .maybeSingle();
+  const myTeamId = me?.id ?? null;
+
   // `any` here intentionally: the Supabase builder's generics overflow the
   // type checker when composed in a helper. Results are cast back below.
   const workItems = () => supabase.from("work_items").select(WORK_ITEM_COLUMNS);
@@ -54,10 +62,15 @@ export default async function OpsDashboard({
         .order("due_date", { ascending: true, nullsFirst: false }),
     ),
     byAssociation(
-      workItems()
-        .eq("owner_user_id", user.id)
-        .in("status", ["open", "in_progress"])
-        .order("due_date", { ascending: true, nullsFirst: false }),
+      (() => {
+        const q = workItems()
+          .in("status", ["open", "in_progress"])
+          .order("due_date", { ascending: true, nullsFirst: false });
+        // Items I claimed (owner) or that Arthur assigned to my roster entry.
+        return myTeamId
+          ? q.or(`owner_user_id.eq.${user.id},assigned_to.eq.${myTeamId}`)
+          : q.eq("owner_user_id", user.id);
+      })(),
     ),
     byAssociation(
       workItems()
