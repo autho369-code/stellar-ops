@@ -105,13 +105,9 @@ export function WorkItemCard({
       )}
 
       <form className="mt-3 flex flex-wrap gap-1.5">
-        <input type="hidden" name="id" value={item.id} />
-
         {!isMine && (
           <button
-            formAction={updateWorkItem}
-            name="claim"
-            value="me"
+            formAction={updateWorkItem.bind(null, { id: item.id, claim: true })}
             className="rounded-md border border-neutral-200 px-2 py-1 text-xs font-medium text-neutral-600 transition hover:bg-neutral-50"
           >
             Claim
@@ -119,9 +115,7 @@ export function WorkItemCard({
         )}
         {item.status !== "in_progress" && item.status !== "done" && (
           <button
-            formAction={updateWorkItem}
-            name="status"
-            value="in_progress"
+            formAction={updateWorkItem.bind(null, { id: item.id, status: "in_progress" })}
             className="rounded-md border border-neutral-200 px-2 py-1 text-xs font-medium text-neutral-600 transition hover:bg-neutral-50"
           >
             Start
@@ -129,9 +123,7 @@ export function WorkItemCard({
         )}
         {item.status !== "done" && (
           <button
-            formAction={updateWorkItem}
-            name="status"
-            value="done"
+            formAction={updateWorkItem.bind(null, { id: item.id, status: "done" })}
             className="rounded-md bg-neutral-900 px-2 py-1 text-xs font-medium text-white transition hover:bg-neutral-800"
           >
             Done
@@ -139,9 +131,7 @@ export function WorkItemCard({
         )}
         {item.status !== "escalated" && item.status !== "done" && (
           <button
-            formAction={updateWorkItem}
-            name="status"
-            value="escalated"
+            formAction={updateWorkItem.bind(null, { id: item.id, status: "escalated" })}
             className="rounded-md border border-amber-200 px-2 py-1 text-xs font-medium text-amber-700 transition hover:bg-amber-50"
           >
             Escalate

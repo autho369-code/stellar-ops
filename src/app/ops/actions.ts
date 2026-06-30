@@ -6,23 +6,27 @@ import { createClient } from "@/lib/supabase/server";
 type WorkItemStatus = "open" | "in_progress" | "escalated" | "done";
 
 // Single server action behind every queue button. Updates status and/or owner.
-export async function updateWorkItem(formData: FormData) {
-  const id = String(formData.get("id") ?? "");
+// Args are bound per-button via .bind() rather than read from the submitter's
+// name/value: Next.js rewrites a submit button's `name` attribute to its own
+// internal action-id token when `formAction` points at a server action, so a
+// button's own `name`/`value` never reaches the action's FormData.
+export async function updateWorkItem(
+  args: { id: string; status?: WorkItemStatus; claim?: boolean },
+  _formData: FormData,
+) {
+  const { id, status, claim } = args;
   if (!id) return;
-
-  const status = formData.get("status");
-  const claim = formData.get("claim"); // "me" to assign to the current user
 
   const supabase = await createClient();
   const patch: Record<string, unknown> = {};
 
-  if (typeof status === "string" && status) {
-    patch.status = status as WorkItemStatus;
+  if (status) {
+    patch.status = status;
     patch.completed_at = status === "done" ? new Date().toISOString() : null;
     if (status !== "escalated") patch.escalated_at = null;
   }
 
-  if (claim === "me") {
+  if (claim) {
     const {
       data: { user },
     } = await supabase.auth.getUser();
