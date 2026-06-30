@@ -237,6 +237,58 @@ function isDocAttachment(att: any): boolean {
   return true;
 }
 
+// Top-level subfolder names inside a Dropbox folder (so we file into the real ones).
+async function dropboxSubfolders(token: string, path: string): Promise<string[]> {
+  const res = await fetch("https://api.dropboxapi.com/2/files/list_folder", {
+    method: "POST",
+    headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json" },
+    body: JSON.stringify({ path, recursive: false, limit: 500 }),
+  });
+  if (!res.ok) return [];
+  const entries = (await res.json()).entries ?? [];
+  return entries.filter((e: any) => e[".tag"] === "folder").map((e: any) => e.name);
+}
+
+// Generic one-shot LLM completion (provider-agnostic), used for classification.
+async function llmText(provider: "anthropic" | "openai", system: string, user: string): Promise<string> {
+  if (provider === "anthropic") {
+    const res = await fetch("https://api.anthropic.com/v1/messages", {
+      method: "POST",
+      headers: { "x-api-key": Deno.env.get("ANTHROPIC_API_KEY")!, "anthropic-version": "2023-06-01", "content-type": "application/json" },
+      body: JSON.stringify({ model: Deno.env.get("ANTHROPIC_MODEL") ?? DEFAULT_ANTHROPIC_MODEL, max_tokens: 64, system, messages: [{ role: "user", content: user }] }),
+    });
+    if (!res.ok) throw new Error(`Anthropic ${res.status}`);
+    return (await res.json()).content?.[0]?.text ?? "";
+  }
+  const base = (Deno.env.get("OPENAI_BASE_URL") ?? DEFAULT_OPENAI_BASE).replace(/\/$/, "");
+  const res = await fetch(`${base}/chat/completions`, {
+    method: "POST",
+    headers: { Authorization: `Bearer ${Deno.env.get("OPENAI_API_KEY")!}`, "Content-Type": "application/json" },
+    body: JSON.stringify({ model: Deno.env.get("OPENAI_MODEL") ?? DEFAULT_OPENAI_MODEL, max_tokens: 64, temperature: 0, messages: [{ role: "system", content: system }, { role: "user", content: user }] }),
+  });
+  if (!res.ok) throw new Error(`OpenAI ${res.status}`);
+  return (await res.json()).choices?.[0]?.message?.content ?? "";
+}
+
+// Choose the existing subfolder an attachment belongs in, matched against the
+// association's REAL folder list. Returns null to leave it in the catch-all.
+async function classifyToSubfolder(provider: "anthropic" | "openai" | null, subject: string, filename: string, subfolders: string[]): Promise<string | null> {
+  if (!provider || subfolders.length === 0) return null;
+  const system = "You file property-management documents into the correct EXISTING folder. Reply with ONLY the exact folder name from the list that best fits this document, or the single word NONE if nothing clearly fits. Output nothing else.";
+  const user = `Email subject: ${subject || "(none)"}\nAttachment filename: ${filename}\n\nFolders:\n${subfolders.join("\n")}`;
+  try {
+    const out = (await llmText(provider, system, user)).trim().replace(/^["']|["']$/g, "");
+    if (/^none$/i.test(out) || !out) return null;
+    return (
+      subfolders.find((s) => s.toLowerCase() === out.toLowerCase()) ??
+      subfolders.find((s) => s.length > 4 && out.toLowerCase().includes(s.toLowerCase())) ??
+      null
+    );
+  } catch (_) {
+    return null;
+  }
+}
+
 Deno.serve(async (req: Request) => {
   const secret = Deno.env.get("CRON_SECRET");
   if (secret) {
@@ -371,15 +423,19 @@ Deno.serve(async (req: Request) => {
         metadata: { graph_message_id: msg.id, mailbox, from: fromAddr, web_link: msg.webLink, draft_created: draftCreated, vendor: vendorName },
       }).select("id").single();
 
-      // File document attachments into the association's Dropbox folder.
+      // File document attachments into the RIGHT subfolder of the association.
       if (msg.hasAttachments && dbxToken && associationId && folderById.get(associationId)) {
         const folder = folderById.get(associationId)!;
         try {
+          const subfolders = await dropboxSubfolders(dbxToken, folder);
           const ar = await fetch(`${GRAPH}/users/${encodeURIComponent(mailbox)}/messages/${msg.id}/attachments`, { headers: { Authorization: `Bearer ${token}` } });
           if (ar.ok) {
             const atts = (await ar.json()).value ?? [];
             for (const att of atts) {
               if (!isDocAttachment(att)) continue;
+              // Dedup: skip if this association already has a file by this name.
+              const { data: dup } = await supabase.from("documents").select("id").eq("company_id", companyId).eq("association_id", associationId).ilike("filename", att.name).maybeSingle();
+              if (dup) continue;
               let bytes: Uint8Array | null = null;
               if (att.contentBytes) {
                 const bin = atob(att.contentBytes);
@@ -389,11 +445,15 @@ Deno.serve(async (req: Request) => {
                 if (v.ok) bytes = new Uint8Array(await v.arrayBuffer());
               }
               if (!bytes) continue;
-              const stored = await dropboxUpload(dbxToken, `${folder}/Email Attachments/${att.name}`, bytes);
+              // Classify into one of the association's existing subfolders.
+              const sub = await classifyToSubfolder(provider, msg.subject ?? "", att.name, subfolders);
+              const targetDir = sub ? `${folder}/${sub}` : `${folder}/Email Attachments`;
+              const stored = await dropboxUpload(dbxToken, `${targetDir}/${att.name}`, bytes);
               if (stored) {
                 await supabase.from("documents").insert({
                   company_id: companyId, association_id: associationId, work_item_id: workItem?.id ?? null,
-                  filename: att.name, doc_type: (att.name.split(".").pop() || "").toLowerCase(), storage_path: stored, classified_by: "agent", status: "filed",
+                  filename: att.name, doc_type: (att.name.split(".").pop() || "").toLowerCase(), storage_path: stored, classified_by: "agent",
+                  status: sub ? "filed" : "needs_review", // unmatched -> flagged, not silently dumped
                 });
                 filed++;
               }
