@@ -3,6 +3,9 @@
 // association's Dropbox folder, then writes factual notes into knowledge_notes
 // (who emails about what, which vendors serve whom, what documents are on file).
 // It never sends, modifies, or deletes mail or files. Replaces prior notes each run.
+//
+// The heavy work runs in the background (EdgeRuntime.waitUntil) and the request
+// returns immediately, so callers (the hub "Learn now" button) don't time out.
 import "jsr:@supabase/functions-js/edge-runtime.d.ts";
 import { createClient } from "jsr:@supabase/supabase-js@2";
 
@@ -41,13 +44,9 @@ function json(o: unknown, status = 200): Response {
 type AStat = { emails: number; subjects: Map<string, number>; senders: Map<string, number>; vendors: Map<string, number> };
 type ADocs = { folders: Set<string>; types: Map<string, number>; files: number };
 
-Deno.serve(async (req: Request) => {
-  let body: any = {};
-  try { body = await req.json(); } catch (_) { /* none */ }
-  const source: string = body.source ?? "all";
+async function runLearn(source: string, maxPer: number): Promise<void> {
   const doEmail = source === "all" || source === "email";
   const doDropbox = source === "all" || source === "dropbox";
-  const maxPer = Math.min(Number(body.maxPerMailbox ?? 80), 200);
 
   const companyId = Deno.env.get("COMPANY_ID") ?? DEFAULT_COMPANY;
   const supabase = createClient(Deno.env.get("SUPABASE_URL")!, Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")!);
@@ -171,6 +170,20 @@ Deno.serve(async (req: Request) => {
   await supabase.from("knowledge_notes").delete().eq("company_id", companyId);
   for (let i = 0; i < notes.length; i += 200) await supabase.from("knowledge_notes").insert(notes.slice(i, i + 200));
   await supabase.from("agent_settings").update({ last_learned_at: new Date().toISOString() }).eq("company_id", companyId);
+}
 
-  return json({ ok: true, emailsSampled, mailboxesRead, foldersListed, associationsLearned: assocWithData, vendors: vStats.size, notes: notes.length, at: new Date().toISOString() });
+Deno.serve(async (req: Request) => {
+  let body: any = {};
+  try { body = await req.json(); } catch (_) { /* none */ }
+  const source: string = body.source ?? "all";
+  const maxPer = Math.min(Number(body.maxPerMailbox ?? 80), 200);
+
+  // Run the (slow) learning in the background and return right away so the
+  // caller never waits on it.
+  const work = runLearn(source, maxPer).catch((e) => console.error("learn-business failed:", e));
+  // @ts-ignore EdgeRuntime is provided by the Supabase edge runtime.
+  if (typeof EdgeRuntime !== "undefined" && EdgeRuntime.waitUntil) EdgeRuntime.waitUntil(work);
+  else await work;
+
+  return json({ ok: true, started: true, at: new Date().toISOString() });
 });

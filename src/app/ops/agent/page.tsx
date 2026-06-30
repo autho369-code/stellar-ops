@@ -1,7 +1,8 @@
 import Link from "next/link";
 import { redirect } from "next/navigation";
 import { createClient } from "@/lib/supabase/server";
-import { learnNow, runAgentNow, saveAgentSettings } from "./actions";
+import { runAgentNow, saveAgentSettings } from "./actions";
+import { LearnButton } from "./LearnButton";
 import { isAdmin } from "@/lib/isAdmin";
 
 export const dynamic = "force-dynamic";
@@ -149,13 +150,7 @@ export default async function AgentPage() {
               {" "}Ask him in chat, e.g. &ldquo;what do you know about Lincoln Park?&rdquo;
             </p>
           </div>
-          {admin && (
-            <form action={learnNow}>
-              <button className="rounded-lg border border-neutral-300 px-3 py-1.5 text-sm font-medium text-neutral-700 transition hover:bg-neutral-50">
-                Learn now
-              </button>
-            </form>
-          )}
+          {admin && <LearnButton />}
         </div>
         <p className="mt-2 text-xs text-neutral-400">
           Read-only: samples recent email and lists Dropbox folders to build a factual snapshot. Re-run after big changes. (Takes a minute.)
