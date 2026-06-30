@@ -206,8 +206,11 @@ export default async function AgentPage() {
             <select id="llm_provider" name="llm_provider" defaultValue={s.llm_provider ?? ""} className={field}>
               <option value="">Auto (uses whichever key is configured)</option>
               <option value="openai">DeepSeek</option>
-              <option value="anthropic">Claude (Anthropic)</option>
+              <option value="anthropic">Claude (Anthropic) — requires ANTHROPIC_API_KEY secret</option>
             </select>
+            <p className="mt-1 text-xs text-amber-600">
+              Claude isn&apos;t wired up with a live key yet — picking it will break chat and drafts until an ANTHROPIC_API_KEY secret is added in Supabase. DeepSeek and Auto both work today.
+            </p>
           </div>
         </section>
 
